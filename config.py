@@ -29,6 +29,9 @@ class ClaudeConfig:
     max_tokens: int = 2048
     temperature: float = 0.7
     api_key: str | None = None
+    # Режим заглушки: не ходит в Claude API, отвечает канонными фразами.
+    # Включается автоматически, если нет ключа, либо явно через MOCK_CLAUDE=true в .env
+    mock: bool = False
 
 
 @dataclass
@@ -76,6 +79,7 @@ class Settings:
                 max_tokens=claude_raw.get("max_tokens", ClaudeConfig.max_tokens),
                 temperature=claude_raw.get("temperature", ClaudeConfig.temperature),
                 api_key=os.getenv("ANTHROPIC_API_KEY"),
+                mock=os.getenv("MOCK_CLAUDE", "").lower() in ("1", "true", "yes"),
             ),
             whisper=WhisperConfig(
                 model=whisper_raw.get("model", WhisperConfig.model),
