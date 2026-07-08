@@ -1,0 +1,20 @@
+# Ядро / API
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+python-dotenv==1.0.1
+PyYAML==6.0.2
+
+# Claude
+anthropic==0.34.2
+
+# Голос
+openai-whisper==20231117
+pyttsx3==2.90
+requests==2.32.3
+
+# Своя нейросеть
+torch==2.4.1
+
+# WebSocket (используется через fastapi/uvicorn[standard], указан явно на всякий случай)
+websockets==13.1
