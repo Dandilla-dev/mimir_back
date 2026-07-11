@@ -17,6 +17,7 @@ from pydantic import BaseModel, EmailStr, Field
 from core.mimir import Mimir
 from core.config import get_settings
 from core.auth_store import AuthError, AuthStore, User
+from core.contacts_store import Contact, ContactsError, ContactsStore
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mimir.api")
@@ -34,6 +35,7 @@ app.add_middleware(
 
 mimir = Mimir(settings=settings)
 auth_store = AuthStore()
+contacts_store = ContactsStore(auth_store)
 
 
 def get_current_user(authorization: str | None = Header(default=None)) -> User:
@@ -88,6 +90,31 @@ class AuthResponse(BaseModel):
 
     user: dict
     token: str
+
+
+class ContactIn(BaseModel):
+    """Один контакт из телефонной книги клиента."""
+
+    name: str = Field(..., min_length=1)
+    phone: str | None = None
+    email: str | None = None
+
+
+class ContactsSyncRequest(BaseModel):
+    contacts: list[ContactIn]
+
+
+class ContactOut(BaseModel):
+    contact_id: str
+    name: str
+    phone: str | None
+    email: str | None
+    is_mimir_user: bool
+    linked_user_id: str | None
+
+
+class ContactsListResponse(BaseModel):
+    contacts: list[ContactOut]
 
 
 # --------- REST эндпоинты ---------
@@ -160,6 +187,39 @@ async def logout(authorization: str | None = Header(default=None)):
 @app.get("/auth/me")
 async def me(current_user: User = Depends(get_current_user)):
     return current_user.to_public_dict()
+
+
+# --------- Контакты (заглушка: данные в памяти процесса) ---------
+
+def _contact_to_out(contact: Contact) -> ContactOut:
+    return ContactOut(**contact.to_public_dict())
+
+
+@app.post("/contacts/sync", response_model=ContactsListResponse)
+async def sync_contacts(
+    req: ContactsSyncRequest, current_user: User = Depends(get_current_user)
+):
+    """Принимает список контактов из телефонной книги клиента, полностью
+    заменяет ими контакты текущего пользователя и отмечает, кто из них
+    уже зарегистрирован в Мимире (по email)."""
+    raw = [c.model_dump() for c in req.contacts]
+    contacts = contacts_store.sync_contacts(current_user.user_id, raw)
+    return ContactsListResponse(contacts=[_contact_to_out(c) for c in contacts])
+
+
+@app.get("/contacts", response_model=ContactsListResponse)
+async def list_contacts(current_user: User = Depends(get_current_user)):
+    contacts = contacts_store.list_contacts(current_user.user_id)
+    return ContactsListResponse(contacts=[_contact_to_out(c) for c in contacts])
+
+
+@app.delete("/contacts/{contact_id}")
+async def delete_contact(contact_id: str, current_user: User = Depends(get_current_user)):
+    try:
+        contacts_store.remove_contact(current_user.user_id, contact_id)
+    except ContactsError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"status": "deleted", "contact_id": contact_id}
 
 
 # --------- WebSocket: потоковый чат для голоса/реального времени ---------
