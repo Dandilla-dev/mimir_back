@@ -52,7 +52,7 @@ class LocalModel:
 
     LABELS = [EventClass.NORMAL, EventClass.ANOMALY, EventClass.THREAT]
 
-    def __init__(self, weights_path: str | Path | None = None, input_dim: int = 32):
+    def __init__(self, weights_path: str | Path | None = None, input_dim: int = 24):
         import torch  # ленивый импорт: нужен только если LocalModel реально создаётся
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
