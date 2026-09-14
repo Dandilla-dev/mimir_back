@@ -41,6 +41,7 @@ DLPCheck при этом остаётся внутренним user_id — эт�
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -56,6 +57,8 @@ from core.message_parser import (
 )
 from core.messages_store import Attachment, Message
 from core.org_store import OrgStore
+
+logger = logging.getLogger("mimir.message_bridge")
 
 
 class BridgeError(Exception):
@@ -90,51 +93,88 @@ def _resolve_email(auth_store: AuthStore, user_id: str) -> str:
     return user.email
 
 
-def check_message(
+def _resolve_recipients(auth_store: AuthStore, message: Message) -> dict[str, str]:
+    """Резолвит email каждого получателя независимо — один мусорный/
+    несуществующий recipient_id не должен гасить проверку для остальных,
+    настоящих получателей того же сообщения (см. обсуждение в чате)."""
+    recipient_emails: dict[str, str] = {}
+    for recipient_id in message.recipient_ids:
+        try:
+            recipient_emails[recipient_id] = _resolve_email(auth_store, recipient_id)
+        except BridgeError:
+            logger.warning(
+                "Сообщение %s указывает несуществующего получателя %s — "
+                "DLP-проверка для него пропущена, для остальных получателей "
+                "продолжается", getattr(message, "message_id", "?"), recipient_id,
+            )
+    return recipient_emails
+
+
+def _lookups_for(contacts_store, subject_user_id: str) -> ParserLookups:
+    if contacts_store is None:
+        return DEFAULT_LOOKUPS
+    return make_lookups_from_contacts_store(contacts_store, subject_user_id)
+
+
+def check_outgoing(
     message: Message,
     org_store: OrgStore,
     auth_store: AuthStore,
     contacts_store=None,
-) -> list[DLPCheck]:
-    """Message (транспорт) -> список DLP-проверок, каждая со своими DLPEvent.
+) -> DLPCheck | None:
+    """Исходящая проверка — утечка конфиденциальных данных от сотрудника.
+    Срабатывает, только если у отправителя активное (approved) членство в
+    организации (mimir_account_linkage_v1.md §2); для личных/standalone
+    аккаунтов возвращает None и НИКОГДА не строит RawMessage — эта ветка
+    для них попросту не существует, не просто "пропущена".
 
-    contacts_store опционален: если передан, is_known_contact в каждой
-    проверке считается по адресной книге именно subject_user_id (через
-    make_lookups_from_contacts_store) — так "новый/известный контакт"
-    оценивается с точки зрения того, чей аккаунт защищаем, а не абстрактно.
-    Без contacts_store используются DEFAULT_LOOKUPS (см. message_parser.py) —
-    так же, как остальные пять признаков без источника данных, до появления
-    соответствующих баз (mimir_architecture_v2.md §7).
+    ПОЛИТИКА ПРИ СБОЕ (вызывающая сторона, не этот модуль, её применяет):
+    это ядро продукта — защита от утечки — поэтому предназначено для
+    fail-closed: исключение отсюда должно останавливать отправку. Нет
+    бытового эквивалента "я и так терплю этот риск" — без Mimir утечку
+    через сотрудника никто не ловит вообще, в отличие от фишинга ниже.
     """
-    checks: list[DLPCheck] = []
+    if not org_store.is_dlp_active(message.sender_id):
+        return None
+
+    sender_email = _resolve_email(auth_store, message.sender_id)
+    recipient_emails = _resolve_recipients(auth_store, message)
+
+    raw = RawMessage(
+        sender_address=sender_email,
+        recipient_addresses=list(recipient_emails.values()),
+        employee_address=sender_email,
+        text=message.text,
+        attachments=[_to_raw_attachment(a) for a in message.attachments],
+        sent_at=_to_datetime(message.sent_at),
+    )
+    events = parse_raw_message(raw, _lookups_for(contacts_store, message.sender_id))
+    return DLPCheck(subject_user_id=message.sender_id, is_incoming=False, events=events)
+
+
+def check_incoming(
+    message: Message,
+    auth_store: AuthStore,
+    contacts_store=None,
+) -> list[DLPCheck]:
+    """Входящая проверка — фишинг/вредоносные вложения. Срабатывает ВСЕГДА,
+    для каждого получателя, независимо от типа аккаунта (в т.ч. личный
+    Mimir) — это защита получателя, а не контроль над отправителем
+    (mimir_account_linkage_v1.md §2).
+
+    ПОЛИТИКА ПРИ СБОЕ (вызывающая сторона её применяет): это защита сверх
+    базового уровня (то же, от чего пользователь и так не защищён в любом
+    обычном мессенджере) — поэтому предназначено для fail-open: исключение
+    отсюда не должно останавливать отправку, только логироваться. Откат
+    при сбое — это откат к уровню риска обычного Telegram, а не новая
+    уязвимость (см. обсуждение в чате).
+    """
+    sender_email = _resolve_email(auth_store, message.sender_id)
+    recipient_emails = _resolve_recipients(auth_store, message)
     attachments = [_to_raw_attachment(a) for a in message.attachments]
     sent_at = _to_datetime(message.sent_at)
 
-    sender_email = _resolve_email(auth_store, message.sender_id)
-    recipient_emails = {
-        recipient_id: _resolve_email(auth_store, recipient_id)
-        for recipient_id in message.recipient_ids
-    }
-
-    def lookups_for(subject_user_id: str) -> ParserLookups:
-        if contacts_store is None:
-            return DEFAULT_LOOKUPS
-        return make_lookups_from_contacts_store(contacts_store, subject_user_id)
-
-    # --- Исходящее: только если у отправителя есть активное членство ---
-    if org_store.is_dlp_active(message.sender_id):
-        raw = RawMessage(
-            sender_address=sender_email,
-            recipient_addresses=list(recipient_emails.values()),
-            employee_address=sender_email,
-            text=message.text,
-            attachments=attachments,
-            sent_at=sent_at,
-        )
-        events = parse_raw_message(raw, lookups_for(message.sender_id))
-        checks.append(DLPCheck(subject_user_id=message.sender_id, is_incoming=False, events=events))
-
-    # --- Входящее: всегда, для каждого получателя ---
+    checks: list[DLPCheck] = []
     for recipient_id, recipient_email in recipient_emails.items():
         raw = RawMessage(
             sender_address=sender_email,
@@ -144,7 +184,25 @@ def check_message(
             attachments=attachments,
             sent_at=sent_at,
         )
-        events = parse_raw_message(raw, lookups_for(recipient_id))
+        events = parse_raw_message(raw, _lookups_for(contacts_store, recipient_id))
         checks.append(DLPCheck(subject_user_id=recipient_id, is_incoming=True, events=events))
 
+    return checks
+
+
+def check_message(
+    message: Message,
+    org_store: OrgStore,
+    auth_store: AuthStore,
+    contacts_store=None,
+) -> list[DLPCheck]:
+    """Удобный шорткат check_outgoing()+check_incoming() одним вызовом и
+    одной политикой отказа — для мест, где различие fail-open/fail-closed
+    по направлению не нужно (например, тесты). В api/server.py используются
+    check_outgoing()/check_incoming() по отдельности — см. их docstring."""
+    checks: list[DLPCheck] = []
+    outgoing = check_outgoing(message, org_store, auth_store, contacts_store)
+    if outgoing is not None:
+        checks.append(outgoing)
+    checks.extend(check_incoming(message, auth_store, contacts_store))
     return checks

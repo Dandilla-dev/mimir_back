@@ -20,6 +20,8 @@ from core.auth_store import AuthError, AuthStore, User
 from core.contacts_store import Contact, ContactsError, ContactsStore
 from core.messages_store import Message, MessagesError, MessagesStore
 from core.org_store import Membership, Organization, OrgError, OrgStore
+from core.message_bridge import check_incoming, check_outgoing
+from core.dlp_events_store import DLPEventsStore
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mimir.api")
@@ -40,6 +42,7 @@ auth_store = AuthStore()
 contacts_store = ContactsStore(auth_store)
 messages_store = MessagesStore()
 org_store = OrgStore()
+dlp_events_store = DLPEventsStore()
 
 
 def get_current_user(authorization: str | None = Header(default=None)) -> User:
@@ -272,11 +275,13 @@ async def delete_contact(contact_id: str, current_user: User = Depends(get_curre
 
 # --------- Сообщения (транспортный слой / слой 1) ---------
 #
-# Только хранение и доставка — без обращений к DLP или Claude (см.
-# core/messages_store.py и mimir_architecture_v2.md, раздел 4). Мост
-# к DLP-парсеру и учёт флага "проверять исходящие" (см.
-# mimir_account_linkage_v1.md) сюда сознательно не входят — отдельный
-# следующий шаг.
+# Хранение и доставка — messages_store.send_message() сам по себе ничего
+# не знает о DLP (mimir_architecture_v2.md §4). После успешной отправки
+# эндпоинт (не сам messages_store!) вызывает core/message_bridge.py —
+# единственный модуль, которому разрешено видеть транспорт, auth и org
+# одновременно — и сохраняет результат через core/dlp_events_store.py.
+# Сбой моста (BridgeError) логируется, но не должен ронять уже
+# состоявшуюся отправку сообщения — см. обсуждение в чате.
 #
 # /messages/send принимает multipart/form-data, а не JSON — вложения
 # идут как настоящие файлы (UploadFile), без base64-раздувания.
@@ -300,7 +305,7 @@ async def send_message(
         for f in files
     ]
     try:
-        message = messages_store.send_message(
+        message = messages_store.build_message(
             sender_id=current_user.user_id,
             recipient_ids=recipient_ids,
             text=text,
@@ -308,6 +313,45 @@ async def send_message(
         )
     except MessagesError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    dlp_checks = []
+
+    # Исходящая — fail-closed. Ядро продукта (утечка от сотрудника): если
+    # проверка не отработала, сообщение НЕ сохраняется и не доставляется
+    # вообще никому, даже настоящим получателям (см. обсуждение в чате —
+    # нет бытового эквивалента "я и так терплю этот риск" для утечки).
+    # check_outgoing() сама возвращает None для личных/standalone
+    # аккаунтов — для них этот блок никогда не бросает и не блокирует.
+    try:
+        outgoing_check = check_outgoing(message, org_store, auth_store, contacts_store)
+    except Exception:
+        logger.exception(
+            "Исходящая DLP-проверка сообщения %s провалилась — сообщение "
+            "НЕ сохранено и не доставлено (fail-closed)", message.message_id,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Проверка сообщения временно недоступна, попробуйте ещё раз",
+        )
+    if outgoing_check is not None:
+        dlp_checks.append(outgoing_check)
+
+    # Входящая — fail-open. Защита получателя от фишинга сверх базового
+    # уровня: если проверка не отработала, сообщение всё равно доставляется
+    # как обычно — откат к риску обычного непроверяемого мессенджера,
+    # а не новая уязвимость (см. обсуждение в чате).
+    try:
+        dlp_checks.extend(check_incoming(message, auth_store, contacts_store))
+    except Exception:
+        logger.exception(
+            "Входящая DLP-проверка сообщения %s провалилась — сообщение "
+            "всё равно будет доставлено (fail-open)", message.message_id,
+        )
+
+    messages_store.store(message)
+    for check in dlp_checks:
+        dlp_events_store.add_check(message.message_id, check)
+
     return _message_to_out(message)
 
 

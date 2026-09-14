@@ -79,20 +79,26 @@ class MessagesStore:
         self._messages_by_id: dict[str, Message] = {}
         self._conversations: dict[str, list[str]] = {}  # conversation_key -> [message_id, ...]
 
-    def send_message(
+    def build_message(
         self,
         sender_id: str,
         recipient_ids: list[str],
         text: str = "",
         attachments: list[dict] | None = None,
     ) -> Message:
+        """Валидирует и строит Message, но НЕ сохраняет его — оно ещё не
+        существует ни в одном индексе, значит его ещё никто не может
+        увидеть через inbox()/conversation_history(). Использовать вместе
+        со store(): построить -> дать вызывающей стороне шанс отказаться
+        от сохранения (например, если DLP-проверка провалилась) -> store().
+        """
         recipient_ids = [r for r in recipient_ids if r != sender_id]
         if not recipient_ids:
             raise MessagesError("Нужен хотя бы один получатель, отличный от отправителя")
         if not text.strip() and not attachments:
             raise MessagesError("Сообщение не может быть пустым (нет ни текста, ни вложений)")
 
-        message = Message(
+        return Message(
             message_id=secrets.token_hex(8),
             sender_id=sender_id,
             recipient_ids=recipient_ids,
@@ -106,15 +112,33 @@ class MessagesStore:
                 for a in (attachments or [])
             ],
         )
+
+    def store(self, message: Message) -> None:
+        """Сохраняет уже построенный (build_message) объект — после этого
+        момента он появляется в inbox() и conversation_history(). Отдельный
+        шаг от build_message() специально для того, чтобы вызывающая
+        сторона могла вставить проверку между "построили" и "доставили"."""
         self._messages_by_id[message.message_id] = message
 
-        key = _conversation_key([sender_id, *recipient_ids])
+        key = _conversation_key([message.sender_id, *message.recipient_ids])
         self._conversations.setdefault(key, []).append(message.message_id)
 
         logger.info(
             "Сообщение отправлено: %s -> %s (%d вложений)",
-            sender_id, recipient_ids, len(message.attachments),
+            message.sender_id, message.recipient_ids, len(message.attachments),
         )
+
+    def send_message(
+        self,
+        sender_id: str,
+        recipient_ids: list[str],
+        text: str = "",
+        attachments: list[dict] | None = None,
+    ) -> Message:
+        """Удобный шорткат build_message()+store() одним вызовом — для
+        случаев, где отдельный шаг проверки между ними не нужен."""
+        message = self.build_message(sender_id, recipient_ids, text, attachments)
+        self.store(message)
         return message
 
     def get_message(self, message_id: str) -> Message:
