@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import Depends, FastAPI, Header, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 
@@ -18,6 +18,7 @@ from core.mimir import Mimir
 from core.config import get_settings
 from core.auth_store import AuthError, AuthStore, User
 from core.contacts_store import Contact, ContactsError, ContactsStore
+from core.messages_store import Message, MessagesError, MessagesStore
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mimir.api")
@@ -36,6 +37,7 @@ app.add_middleware(
 mimir = Mimir(settings=settings)
 auth_store = AuthStore()
 contacts_store = ContactsStore(auth_store)
+messages_store = MessagesStore()
 
 
 def get_current_user(authorization: str | None = Header(default=None)) -> User:
@@ -115,6 +117,25 @@ class ContactOut(BaseModel):
 
 class ContactsListResponse(BaseModel):
     contacts: list[ContactOut]
+
+
+class AttachmentOut(BaseModel):
+    attachment_id: str
+    filename: str
+    size_bytes: int
+
+
+class MessageOut(BaseModel):
+    message_id: str
+    sender_id: str
+    recipient_ids: list[str]
+    text: str
+    attachments: list[AttachmentOut]
+    sent_at: float
+
+
+class MessagesListResponse(BaseModel):
+    messages: list[MessageOut]
 
 
 # --------- REST эндпоинты ---------
@@ -220,6 +241,67 @@ async def delete_contact(contact_id: str, current_user: User = Depends(get_curre
     except ContactsError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"status": "deleted", "contact_id": contact_id}
+
+
+# --------- Сообщения (транспортный слой / слой 1) ---------
+#
+# Только хранение и доставка — без обращений к DLP или Claude (см.
+# core/messages_store.py и mimir_architecture_v2.md, раздел 4). Мост
+# к DLP-парсеру и учёт флага "проверять исходящие" (см.
+# mimir_account_linkage_v1.md) сюда сознательно не входят — отдельный
+# следующий шаг.
+#
+# /messages/send принимает multipart/form-data, а не JSON — вложения
+# идут как настоящие файлы (UploadFile), без base64-раздувания.
+# recipient_ids передаётся как повторяющееся form-поле:
+#   recipient_ids=u2&recipient_ids=u3 (или несколько частей формы с
+#   одним и тем же именем при отправке через FormData на фронте).
+
+def _message_to_out(message: Message) -> MessageOut:
+    return MessageOut(**message.to_public_dict())
+
+
+@app.post("/messages/send", response_model=MessageOut)
+async def send_message(
+    recipient_ids: list[str] = Form(...),
+    text: str = Form(""),
+    files: list[UploadFile] = File(default=[]),
+    current_user: User = Depends(get_current_user),
+):
+    attachments = [
+        {"filename": f.filename, "content": await f.read()}
+        for f in files
+    ]
+    try:
+        message = messages_store.send_message(
+            sender_id=current_user.user_id,
+            recipient_ids=recipient_ids,
+            text=text,
+            attachments=attachments,
+        )
+    except MessagesError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _message_to_out(message)
+
+
+@app.get("/messages/history/{other_user_id}", response_model=MessagesListResponse)
+async def message_history(
+    other_user_id: str, current_user: User = Depends(get_current_user)
+):
+    """История 1-на-1 переписки. Групповая история (3+ участников) через REST
+    пока не открыта — messages_store.conversation_history() уже это умеет,
+    эндпоинт для неё можно добавить отдельно, когда появятся групповые чаты
+    на фронте."""
+    history = messages_store.conversation_history(
+        [current_user.user_id, other_user_id]
+    )
+    return MessagesListResponse(messages=[_message_to_out(m) for m in history])
+
+
+@app.get("/messages/inbox", response_model=MessagesListResponse)
+async def message_inbox(current_user: User = Depends(get_current_user)):
+    inbox = messages_store.inbox(current_user.user_id)
+    return MessagesListResponse(messages=[_message_to_out(m) for m in inbox])
 
 
 # --------- WebSocket: потоковый чат для голоса/реального времени ---------
