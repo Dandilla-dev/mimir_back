@@ -98,6 +98,11 @@ class AuthStore:
             return None
         return self._users_by_id.get(user_id)
 
+    def user_by_id(self, user_id: str) -> User | None:
+        """Нужен мосту (core/message_bridge.py) — чтобы превратить внутренний
+        user_id из messages_store в реальный email-адрес для RawMessage."""
+        return self._users_by_id.get(user_id)
+
     def logout(self, token: str) -> None:
         self._tokens.pop(token, None)
 
