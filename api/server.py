@@ -19,6 +19,7 @@ from core.config import get_settings
 from core.auth_store import AuthError, AuthStore, User
 from core.contacts_store import Contact, ContactsError, ContactsStore
 from core.messages_store import Message, MessagesError, MessagesStore
+from core.org_store import Membership, Organization, OrgError, OrgStore
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mimir.api")
@@ -38,6 +39,7 @@ mimir = Mimir(settings=settings)
 auth_store = AuthStore()
 contacts_store = ContactsStore(auth_store)
 messages_store = MessagesStore()
+org_store = OrgStore()
 
 
 def get_current_user(authorization: str | None = Header(default=None)) -> User:
@@ -136,6 +138,31 @@ class MessageOut(BaseModel):
 
 class MessagesListResponse(BaseModel):
     messages: list[MessageOut]
+
+
+class CreateOrgRequest(BaseModel):
+    name: str = Field(..., min_length=1)
+
+
+class OrgOut(BaseModel):
+    org_id: str
+    name: str
+    created_by: str
+
+
+class MembershipOut(BaseModel):
+    membership_id: str
+    user_id: str
+    org_id: str
+    role: str
+    status: str
+    requested_at: float
+    decided_by: str | None
+    decided_at: float | None
+
+
+class MembershipsListResponse(BaseModel):
+    memberships: list[MembershipOut]
 
 
 # --------- REST эндпоинты ---------
@@ -302,6 +329,89 @@ async def message_history(
 async def message_inbox(current_user: User = Depends(get_current_user)):
     inbox = messages_store.inbox(current_user.user_id)
     return MessagesListResponse(messages=[_message_to_out(m) for m in inbox])
+
+
+# --------- Организации и членство (слой 4) ---------
+#
+# Флаг DLP-проверки — свойство аккаунта, реализованное здесь (approved-
+# членство), а не сообщения. См. mimir_account_linkage_v1.md. Эти эндпоинты
+# сами не вызывают ни message_parser, ни claude_adapter — только хранят
+# и отдают факт привязки. Решение "проверять ли это исходящее сообщение"
+# принимает мост (ещё не реализован), опираясь на org_store.is_dlp_active().
+
+def _org_to_out(org: Organization) -> OrgOut:
+    return OrgOut(**org.to_public_dict())
+
+
+def _membership_to_out(membership: Membership) -> MembershipOut:
+    return MembershipOut(**membership.to_public_dict())
+
+
+@app.post("/orgs", response_model=OrgOut)
+async def create_org(
+    req: CreateOrgRequest, current_user: User = Depends(get_current_user)
+):
+    """Создатель автоматически становится первым security_officer (см.
+    org_store.py docstring про долг "кто назначает первого офицера")."""
+    try:
+        org = org_store.create_organization(current_user.user_id, req.name)
+    except OrgError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _org_to_out(org)
+
+
+@app.post("/orgs/{org_id}/join", response_model=MembershipOut)
+async def request_membership(
+    org_id: str, current_user: User = Depends(get_current_user)
+):
+    try:
+        membership = org_store.request_membership(current_user.user_id, org_id)
+    except OrgError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _membership_to_out(membership)
+
+
+@app.get("/orgs/{org_id}/pending", response_model=MembershipsListResponse)
+async def list_pending_memberships(
+    org_id: str, current_user: User = Depends(get_current_user)
+):
+    """Список заявок на рассмотрении. Доступ не ограничен ролью на уровне
+    самого просмотра (заглушка) — проверка роли встаёт в approve/reject."""
+    pending = org_store.list_pending(org_id)
+    return MembershipsListResponse(memberships=[_membership_to_out(m) for m in pending])
+
+
+@app.post("/orgs/memberships/{membership_id}/approve", response_model=MembershipOut)
+async def approve_membership(
+    membership_id: str, current_user: User = Depends(get_current_user)
+):
+    """Только security_officer организации может одобрить — проверяется
+    внутри org_store.approve()."""
+    try:
+        membership = org_store.approve(membership_id, current_user.user_id)
+    except OrgError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    return _membership_to_out(membership)
+
+
+@app.post("/orgs/memberships/{membership_id}/reject", response_model=MembershipOut)
+async def reject_membership(
+    membership_id: str, current_user: User = Depends(get_current_user)
+):
+    try:
+        membership = org_store.reject(membership_id, current_user.user_id)
+    except OrgError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    return _membership_to_out(membership)
+
+
+@app.get("/me/membership", response_model=MembershipOut | None)
+async def my_membership(current_user: User = Depends(get_current_user)):
+    """Активное (approved) членство текущего пользователя, если есть — сам
+    и есть тот самый "флаг", включающий DLP-проверку исходящих (ещё не
+    подключено ни к чему — просто отдаёт состояние)."""
+    membership = org_store.get_active_membership(current_user.user_id)
+    return _membership_to_out(membership) if membership else None
 
 
 # --------- WebSocket: потоковый чат для голоса/реального времени ---------
