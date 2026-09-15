@@ -188,6 +188,42 @@ class OrgStore:
                 return
         raise OrgError("Только security_officer этой организации может решать по заявкам")
 
+    def is_security_officer(self, user_id: str, org_id: str) -> bool:
+        """Публичная проверка роли, без исключения — для гейтинга на
+        уровне API (см. api/server.py, /moderation/*), где отказ должен
+        стать HTTP 403, а не внутренней ошибкой стора. В отличие от
+        _require_security_officer() ниже (используется для /orgs/* —
+        решений по заявкам на членство) просто отвечает bool; логика
+        поиска членства та же."""
+        for m in self._memberships.values():
+            if (
+                m.user_id == user_id
+                and m.org_id == org_id
+                and m.status == MembershipStatus.APPROVED
+                and m.role == MembershipRole.SECURITY_OFFICER
+            ):
+                return True
+        return False
+
+    def is_owner(self, user_id: str, org_id: str) -> bool:
+        """Владелец организации — тот, кто её создал (Organization.created_by),
+        см. обсуждение в чате: изолированного security_officer может
+        разблокировать только владелец, не другой officer (иначе
+        скомпрометированный officer снимает изоляцию через другого
+        officer'а или сам с собой, если officer'ов несколько).
+
+        ПИЛОТНАЯ ЗАГЛУШКА: делегирование прав владельца отдельному
+        назначенному лицу ("либо назначенное им лицо", см. обсуждение в
+        чате) пока не реализовано — тот же класс долга, что и "кто
+        назначает первого security_officer" (docstring create_organization
+        выше). Публичная проверка без исключения — тот же паттерн, что
+        is_security_officer()."""
+        try:
+            org = self.get_organization(org_id)
+        except OrgError:
+            return False
+        return org.created_by == user_id
+
     def approve(self, membership_id: str, decider_user_id: str) -> Membership:
         membership = self._get_membership(membership_id)
         self._require_security_officer(decider_user_id, membership.org_id)

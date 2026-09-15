@@ -116,6 +116,11 @@ _IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "gif", "bmp", "webp", "svg"}
 _DOCUMENT_EXTENSIONS = {
     "doc", "docx", "xls", "xlsx", "ppt", "pptx", "pdf", "txt", "rtf", "odt", "csv",
 }
+# Голосовые сообщения между пользователями (не путать с voice/*.py — это
+# отдельный, личный голосовой цикл Mimir-ассистента). Используется ТОЛЬКО
+# гейтингом изоляции в api/server.py (см. is_audio_attachment ниже) —
+# DLP-классификация (AttachmentCategory) это множество не различает.
+_AUDIO_EXTENSIONS = {"mp3", "wav", "ogg", "m4a", "opus", "flac", "aac"}
 
 _CONFIDENTIALITY_PATTERN = re.compile(
     r"\b(confidential|конфиденциально|коммерческая тайна|nda|не для распространения|"
@@ -198,6 +203,22 @@ def _extract_first_link_domain(text: str) -> str | None:
     if not match:
         return None
     return match.group(1).lower()
+
+
+def is_audio_attachment(filename: str) -> bool:
+    """Публичная проверка — используется ТОЛЬКО гейтингом изоляции в
+    api/server.py (/messages/send), не DLP-классификацией событий
+    (та работает через AttachmentCategory в core/dlp_features.py,
+    множество расширений там другое и не пересекается по смыслу)."""
+    return _extension_of(filename) in _AUDIO_EXTENSIONS
+
+
+def contains_link(text: str) -> bool:
+    """Публичная проверка — есть ли в тексте http(s)-ссылка. Использует
+    тот же _URL_PATTERN, что и основной парсер (has_external_link внутри
+    parse_raw_message), но как отдельная функция: гейтингу изоляции в
+    api/server.py не нужен полный RawMessage/DLPEvent, только да/нет."""
+    return _URL_PATTERN.search(text) is not None
 
 
 def _domain_of(address: str) -> str:

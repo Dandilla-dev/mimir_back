@@ -24,6 +24,8 @@ from core.message_bridge import check_incoming, check_outgoing
 from core.dlp_events_store import DLPEventsStore
 from core.dlp_heuristics import ThreatLevel, classify
 from core.moderation_store import ModerationError, ModerationStore
+from core.isolation_store import IsolationError, IsolationStore
+from core.message_parser import is_audio_attachment, contains_link
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mimir.api")
@@ -46,6 +48,7 @@ messages_store = MessagesStore()
 org_store = OrgStore()
 dlp_events_store = DLPEventsStore()
 moderation_store = ModerationStore()
+isolation_store = IsolationStore()
 
 
 def get_current_user(authorization: str | None = Header(default=None)) -> User:
@@ -171,6 +174,43 @@ class ModerationQueueResponse(BaseModel):
 class ModerationResolveResponse(BaseModel):
     status: str
     message: MessageOut
+
+
+class AnomalySubjectSummary(BaseModel):
+    """Сводка по одному отправителю — агрегация вместо карточки на
+    каждое событие (см. обсуждение в чате: вариант 2 для ANOMALY,
+    в отличие от THREAT-модерации по одной карточке)."""
+
+    user_id: str
+    email: str
+    name: str
+    count: int
+    reason_counts: dict[str, int]
+    last_recorded_at: float
+
+
+class AnomalySummaryResponse(BaseModel):
+    summary: list[AnomalySubjectSummary]
+
+
+class IsolatedUserOut(BaseModel):
+    """Один изолированный пользователь — с резолвнутым email/именем,
+    тем же паттерном, что и AnomalySubjectSummary выше."""
+
+    user_id: str
+    email: str
+    name: str
+    threat_reasons: list[str]
+    isolated_at: float
+
+
+class IsolatedListResponse(BaseModel):
+    isolated: list[IsolatedUserOut]
+
+
+class LiftIsolationResponse(BaseModel):
+    status: str = "lifted"
+    user_id: str
 
 
 class CreateOrgRequest(BaseModel):
@@ -318,16 +358,34 @@ async def delete_contact(contact_id: str, current_user: User = Depends(get_curre
 # доставляется сразу, но и не отбрасывается: удерживается в
 # core/moderation_store.py до решения человека (см. обсуждение в чате,
 # пункт 2 — не автономная блокировка без пути назад, и не молчаливая
-# пометка постфактум). Для ВХОДЯЩЕЙ проверки такое решение не обсуждалось
-# и не принято — THREAT там пока только классифицируется и сохраняется в
-# dlp_events_store, доставка не блокируется (сообщение и раньше доставлялось
-# при сбое самой проверки, fail-open) — если нужно то же удержание для
-# входящих (фишинг), это отдельное решение, TODO.
+# пометка постфактум).
 #
-# TODO (роли, MIMIR_development_plan.md недели 5-6): /moderation/* сейчас
-# доступны любому аутентифицированному пользователю — роль "офицер
-# безопасности" ещё не спроектирована ни в auth_store.py, ни в org_store.py.
-# Ограничить доступ, когда роли появятся.
+# THREAT для ВХОДЯЩЕЙ проверки (фишинг) — закрывает открытый вопрос 1
+# (см. обсуждение в чате). Держать/блокировать каждое такое сообщение до
+# решения человека не масштабируется: входящий THREAT завязан на действие
+# АТАКУЮЩЕГО, не сотрудника — одна фишинговая рассылка может одновременно
+# задеть сотни получателей, в отличие от исходящего THREAT, который по
+# конструкции редкий. Поэтому сообщение доставляется как раньше
+# (fail-open, без изменений) — но ПОЛУЧАТЕЛЬ автоматически изолируется
+# через core/isolation_store.py, если он org-linked (для personal-
+# аккаунтов автоизоляция не применяется вообще — снять было бы некому).
+# Изолированный аккаунт не может сам отправлять коллегам файлы (кроме
+# аудио) и ссылки — см. проверку в начале send_message() ниже — пока
+# security_officer не снимет изоляцию через /moderation/isolated/{id}/lift.
+# Изоляция также закрывает доступ к данным организации (см.
+# _require_not_isolated) — на сегодня единственный такой ресурс в проекте
+# — GET /orgs/{org_id}/pending.
+#
+
+# РОЛИ (MIMIR_development_plan.md недели 5-6, закрывает открытый вопрос
+# из обсуждения в чате): /moderation/* доступны только security_officer
+# ОРГАНИЗАЦИИ ОТПРАВИТЕЛЯ удержанного сообщения — та же роль
+# (org_store.MembershipRole.SECURITY_OFFICER), что уже решает заявки на
+# членство в /orgs/memberships/*, отдельной DLP-роли сознательно нет
+# (см. обсуждение в чате). Hold без организации у отправителя не бывает:
+# check_outgoing() возвращает None ещё до всякой классификации для
+# personal-аккаунтов (org_store.is_dlp_active() == False) — см.
+# _require_moderation_access() ниже.
 #
 # /messages/send принимает multipart/form-data, а не JSON — вложения
 # идут как настоящие файлы (UploadFile), без base64-раздувания.
@@ -337,6 +395,68 @@ async def delete_contact(contact_id: str, current_user: User = Depends(get_curre
 
 def _message_to_out(message: Message) -> MessageOut:
     return MessageOut(**message.to_public_dict())
+
+
+def _require_not_isolated(current_user: User) -> None:
+    """Изолированный аккаунт теряет доступ не только к отправке файлов/
+    ссылок (см. проверку в send_message() ниже), но и к данным
+    организации — см. обсуждение в чате. Сейчас в проекте это ЕДИНСТВЕННЫЙ
+    такой ресурс: GET /orgs/{org_id}/pending (список заявок на членство).
+    Общих документов/базы контактов и т.п. на уровне организации в
+    проекте пока нет (contacts_store.py/messages_store.py/memory.py —
+    всё персональное, к org_id не привязано) — когда такие ресурсы
+    появятся, гейтить их тем же способом."""
+    if isolation_store.is_isolated(current_user.user_id):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Аккаунт изолирован — доступ к данным организации ограничен, "
+                "пока security_officer не снимет изоляцию"
+            ),
+        )
+
+
+def _require_officer_for_user(target_user_id: str, current_user: User) -> None:
+    """Общая проверка прав: current_user должен быть security_officer
+    организации, где target_user_id состоит (approved membership), И САМ
+    НЕ ИЗОЛИРОВАН (см. обсуждение в чате: изоляция закрывает доступ ко
+    ВСЕМУ в организации, включая собственные officer-права — иначе
+    скомпрометированный officer снимает изоляцию сам с себя одним вызовом
+    API, и весь механизм бессмысленен). Используется и для модерации
+    исходящих holds (target = отправитель), и для снятия изоляции
+    (target = изолированный получатель) — в обоих случаях право
+    разбирать принадлежит НЕ-изолированному officer'у той же организации.
+
+    Если изолированный — единственный officer организации, снять с него
+    изоляцию через API не сможет никто — известный временный долг пилота
+    (см. MIMIR_development_plan.md: полноценных ролей владелец/сотрудники/
+    разработчик ещё нет), не решается в рамках этой сессии."""
+    if isolation_store.is_isolated(current_user.user_id):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Аккаунт изолирован — officer-права недоступны, пока другой "
+                "security_officer этой организации не снимет изоляцию"
+            ),
+        )
+    membership = org_store.get_active_membership(target_user_id)
+    if membership is None or not org_store.is_security_officer(
+        current_user.user_id, membership.org_id
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Только security_officer организации этого пользователя может это сделать",
+        )
+
+
+def _require_moderation_access(message: Message, current_user: User) -> None:
+    """Право модерировать hold принадлежит security_officer ОРГАНИЗАЦИИ
+    ОТПРАВИТЕЛЯ (см. комментарий над /moderation/* выше). membership is
+    None здесь для сегодняшнего кода недостижимо — hold без организации
+    у отправителя не создаётся (check_outgoing() отсекает personal-
+    аккаунты раньше любой классификации) — проверка оставлена как
+    защита от будущего рефакторинга, а не обработка реального случая."""
+    _require_officer_for_user(message.sender_id, current_user)
 
 
 @app.post("/messages/send", response_model=MessageOut | MessagePendingModerationOut)
@@ -350,6 +470,34 @@ async def send_message(
         {"filename": f.filename, "content": await f.read()}
         for f in files
     ]
+
+    # Изоляция (core/isolation_store.py, см. обсуждение в чате, закрывает
+    # открытый вопрос 1): изолированный аккаунт не может сам отправлять
+    # файлы (кроме аудио) и ссылки — только текст/голос — пока
+    # security_officer не снимет изоляцию. Проверяется ДО build_message:
+    # нет смысла строить сообщение, которое всё равно будет отклонено.
+    if isolation_store.is_isolated(current_user.user_id):
+        disallowed_files = [
+            a["filename"] for a in attachments if not is_audio_attachment(a["filename"])
+        ]
+        if disallowed_files:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Аккаунт изолирован после получения сообщения с признаками угрозы — "
+                    "отправлять файлы (кроме аудио) нельзя, пока security_officer не "
+                    f"снимет изоляцию: {', '.join(disallowed_files)}"
+                ),
+            )
+        if contains_link(text):
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Аккаунт изолирован после получения сообщения с признаками угрозы — "
+                    "отправка ссылок недоступна, пока security_officer не снимет изоляцию"
+                ),
+            )
+
     try:
         message = messages_store.build_message(
             sender_id=current_user.user_id,
@@ -420,7 +568,23 @@ async def send_message(
             "всё равно будет доставлено (fail-open)", message.message_id,
         )
     for check in incoming_checks:
-        dlp_checks.append((check, [classify(event) for event in check.events]))
+        classifications = [classify(event) for event in check.events]
+        dlp_checks.append((check, classifications))
+
+        # Автоизоляция получателя (core/isolation_store.py, открытый
+        # вопрос 1): входящий THREAT сообщение НЕ блокирует (fail-open,
+        # как и раньше), но получателя изолирует — если он org-linked.
+        # Для personal-аккаунтов изоляция НЕ применяется вообще (см.
+        # обсуждение в чате) — снять её было бы некому, у personal нет
+        # security_officer.
+        threat_reasons = [
+            reason
+            for result in classifications
+            for reason in result.threat_reasons
+            if result.level == ThreatLevel.THREAT
+        ]
+        if threat_reasons and org_store.get_active_membership(check.subject_user_id) is not None:
+            isolation_store.isolate(check.subject_user_id, threat_reasons)
 
     messages_store.store(message)
     for check, classifications in dlp_checks:
@@ -436,7 +600,15 @@ async def moderation_pending(current_user: User = Depends(get_current_user)):
     обсуждение в чате, пункт про масштаб на 1000 сотрудников): THREAT
     рассчитан на редкие самодостаточные сигналы, каждый требует решения
     человека по отдельности, не пачкой."""
-    pending = moderation_store.list_pending()
+    _require_not_isolated(current_user)
+    # Видна только очередь ТЕХ организаций, где current_user —
+    # security_officer (см. _require_moderation_access) — не глобальная
+    # очередь всей системы вне зависимости от того, кто спрашивает.
+    pending = [
+        p for p in moderation_store.list_pending()
+        if (m := org_store.get_active_membership(p.message.sender_id)) is not None
+        and org_store.is_security_officer(current_user.user_id, m.org_id)
+    ]
     return ModerationQueueResponse(
         pending=[
             PendingModerationOut(
@@ -456,9 +628,11 @@ async def moderation_approve(hold_id: str, current_user: User = Depends(get_curr
     срабатывание эвристики) — снимает с модерации и ТОЛЬКО теперь
     вызывает messages_store.store(), делая сообщение видимым получателю."""
     try:
-        message = moderation_store.resolve(hold_id)
+        pending = moderation_store.get(hold_id)  # без снятия из очереди — сперва право, потом resolve
     except ModerationError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    _require_moderation_access(pending.message, current_user)
+    message = moderation_store.resolve(hold_id)
     messages_store.store(message)
     return ModerationResolveResponse(status="approved", message=_message_to_out(message))
 
@@ -468,10 +642,151 @@ async def moderation_reject(hold_id: str, current_user: User = Depends(get_curre
     """Человек подтвердил угрозу — снимает с модерации и НЕ вызывает
     store(): сообщение никогда не становится видимым получателю."""
     try:
-        message = moderation_store.resolve(hold_id)
+        pending = moderation_store.get(hold_id)
     except ModerationError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    _require_moderation_access(pending.message, current_user)
+    message = moderation_store.resolve(hold_id)
     return ModerationResolveResponse(status="rejected", message=_message_to_out(message))
+
+
+@app.get("/moderation/anomaly-summary", response_model=AnomalySummaryResponse)
+async def anomaly_summary(current_user: User = Depends(get_current_user)):
+    """Агрегированная сводка по ANOMALY-событиям, сгруппированная по
+    отправителю (см. обсуждение в чате: решение — вариант 2, сводка
+    вместо карточки на каждое событие; при 1000 сотрудниках одиночные
+    ANOMALY идут пачкой, не по одной записи, в отличие от THREAT).
+
+    Это ТОЛЬКО группировка при чтении поверх уже сохранённых
+    core/dlp_events_store.DLPEventRecord — отдельного хранилища под
+    сводку нет и не нужно, полей level/anomaly_reasons уже достаточно.
+
+    subject_user_id для ANOMALY-записи — всегда отправитель (все
+    ANOMALY-правила в core/dlp_heuristics.py срабатывают только на
+    исходящей проверке, is_incoming=False) — то есть тот, кто фактически
+    создал аномальную отправку, а не случайный третий пользователь.
+
+    Видна только та часть сводки, что относится к организациям, где
+    current_user — security_officer (тот же принцип гейтинга, что и
+    /moderation/*, см. _require_moderation_access) — офицер одной
+    компании не должен видеть нарушителей другой.
+
+    user_id резолвится в email/имя через auth_store.user_by_id() — тот
+    же паттерн резолва, что уже применён в core/message_bridge.py при
+    построении RawMessage."""
+    _require_not_isolated(current_user)
+    records = dlp_events_store.list_by_level(ThreatLevel.ANOMALY)
+
+    grouped: dict[str, list] = {}
+    for record in records:
+        grouped.setdefault(record.subject_user_id, []).append(record)
+
+    summary: list[AnomalySubjectSummary] = []
+    for user_id, user_records in grouped.items():
+        membership = org_store.get_active_membership(user_id)
+        if membership is None or not org_store.is_security_officer(
+            current_user.user_id, membership.org_id
+        ):
+            continue  # не организация current_user — не его дело разбирать
+
+        user = auth_store.user_by_id(user_id)
+        if user is None:
+            continue  # защитная ветка: аккаунт мог быть удалён, событие осталось
+
+        reason_counts: dict[str, int] = {}
+        for record in user_records:
+            for reason in record.anomaly_reasons:
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
+
+        summary.append(
+            AnomalySubjectSummary(
+                user_id=user_id,
+                email=user.email,
+                name=user.name,
+                count=len(user_records),
+                reason_counts=reason_counts,
+                last_recorded_at=max(r.recorded_at for r in user_records),
+            )
+        )
+
+    # Больше всего нарушений — первым: офицеру интереснее всего разобрать
+    # сначала самый заметный паттерн, не хронологию по алфавиту user_id.
+    summary.sort(key=lambda s: s.count, reverse=True)
+    return AnomalySummaryResponse(summary=summary)
+
+
+@app.get("/moderation/isolated", response_model=IsolatedListResponse)
+async def isolated_list(current_user: User = Depends(get_current_user)):
+    """Активные изоляции (core/isolation_store.py) — видны только те, что
+    относятся к организациям, где current_user — security_officer (тот
+    же принцип, что и /moderation/pending, /moderation/anomaly-summary)."""
+    _require_not_isolated(current_user)
+    isolated: list[IsolatedUserOut] = []
+    for record in isolation_store.list_active():
+        membership = org_store.get_active_membership(record.user_id)
+        if membership is None or not org_store.is_security_officer(
+            current_user.user_id, membership.org_id
+        ):
+            continue
+
+        user = auth_store.user_by_id(record.user_id)
+        if user is None:
+            continue  # защитная ветка: аккаунт мог быть удалён
+
+        isolated.append(
+            IsolatedUserOut(
+                user_id=record.user_id,
+                email=user.email,
+                name=user.name,
+                threat_reasons=record.threat_reasons,
+                isolated_at=record.isolated_at,
+            )
+        )
+
+    isolated.sort(key=lambda i: i.isolated_at)
+    return IsolatedListResponse(isolated=isolated)
+
+
+@app.post("/moderation/isolated/{user_id}/lift", response_model=LiftIsolationResponse)
+async def lift_isolation(user_id: str, current_user: User = Depends(get_current_user)):
+    """Снимает изоляцию. Право зависит от того, КТО изолирован (см.
+    обсуждение в чате):
+    - обычный сотрудник -> любой НЕ изолированный security_officer его
+      организации (как и раньше, _require_officer_for_user);
+    - сам security_officer -> только владелец организации
+      (org_store.is_owner). Если бы officer мог разблокировать другого
+      officer'а (или тем более себя), скомпрометированный officer снимал
+      бы изоляцию сам с собой или через сговор — ответственность за этот
+      случай явно передаётся человеку (владельцу бизнеса), не автоматике.
+    """
+    _require_not_isolated(current_user)  # актёр сам не должен быть изолирован ни в одной ветке
+
+    membership = org_store.get_active_membership(user_id)
+    if membership is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Пользователь не найден или не состоит в организации",
+        )
+
+    if org_store.is_security_officer(user_id, membership.org_id):
+        if current_user.user_id == user_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Владелец не может быть тем же лицом, что и разблокируемый security_officer",
+            )
+        if not org_store.is_owner(current_user.user_id, membership.org_id):
+            raise HTTPException(
+                status_code=403,
+                detail="Изолированного security_officer может разблокировать только владелец организации",
+            )
+    else:
+        _require_officer_for_user(user_id, current_user)
+
+    try:
+        isolation_store.lift(user_id, lifted_by=current_user.user_id)
+    except IsolationError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return LiftIsolationResponse(user_id=user_id)
 
 
 @app.get("/messages/history/{other_user_id}", response_model=MessagesListResponse)
@@ -539,7 +854,10 @@ async def list_pending_memberships(
     org_id: str, current_user: User = Depends(get_current_user)
 ):
     """Список заявок на рассмотрении. Доступ не ограничен ролью на уровне
-    самого просмотра (заглушка) — проверка роли встаёт в approve/reject."""
+    самого просмотра (заглушка) — проверка роли встаёт в approve/reject.
+    Изолированному пользователю недоступно вообще (см. _require_not_isolated
+    — данные организации, не персональные)."""
+    _require_not_isolated(current_user)
     pending = org_store.list_pending(org_id)
     return MembershipsListResponse(memberships=[_membership_to_out(m) for m in pending])
 
