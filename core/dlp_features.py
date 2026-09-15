@@ -62,6 +62,41 @@ class DLPEvent:
     lacks_legitimate_access: bool = False
     has_elevated_rights: bool = False
 
+    def to_public_dict(self) -> dict:
+        """Представление для REST (дашборд офицера безопасности и т.п.).
+        По тому же паттерну, что Message.to_public_dict() в
+        messages_store.py — объект сам знает, как себя показать наружу,
+        чтобы сериализация не расходилась с реальным набором полей
+        (не дублируется вручную где-то ещё, например в dlp_events_store.py).
+        """
+        return {
+            # Блок 1
+            "is_incoming": self.is_incoming,
+            "counterparty_external": self.counterparty_external,
+            "counterparty_new": self.counterparty_new,
+            "counterparty_address_personal": self.counterparty_address_personal,
+            "counterparty_domain_watchlisted": self.counterparty_domain_watchlisted,
+            # Блок 2
+            "has_attachment": self.has_attachment,
+            "attachment_size_bytes": self.attachment_size_bytes,
+            "attachment_category": self.attachment_category.value,
+            "has_macro_or_executable_code": self.has_macro_or_executable_code,
+            "confidentiality_marker_found": self.confidentiality_marker_found,
+            "attachment_password_protected": self.attachment_password_protected,
+            "has_external_link": self.has_external_link,
+            "link_not_whitelisted": self.link_not_whitelisted,
+            # Блок 3
+            "event_time": self.event_time.isoformat(),
+            "is_non_working_day": self.is_non_working_day,
+            "near_termination": self.near_termination,
+            "on_official_leave": self.on_official_leave,
+            # Блок 5
+            "device_unregistered": self.device_unregistered,
+            # Блок 6
+            "lacks_legitimate_access": self.lacks_legitimate_access,
+            "has_elevated_rights": self.has_elevated_rights,
+        }
+
 
 # Потолок логарифмической нормализации размера вложения. Всё крупнее —
 # схлопывается к 1.0 (для DLP важен сам факт "необычно большой файл",

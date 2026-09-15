@@ -22,6 +22,8 @@ from core.messages_store import Message, MessagesError, MessagesStore
 from core.org_store import Membership, Organization, OrgError, OrgStore
 from core.message_bridge import check_incoming, check_outgoing
 from core.dlp_events_store import DLPEventsStore
+from core.dlp_heuristics import ThreatLevel, classify
+from core.moderation_store import ModerationError, ModerationStore
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mimir.api")
@@ -43,6 +45,7 @@ contacts_store = ContactsStore(auth_store)
 messages_store = MessagesStore()
 org_store = OrgStore()
 dlp_events_store = DLPEventsStore()
+moderation_store = ModerationStore()
 
 
 def get_current_user(authorization: str | None = Header(default=None)) -> User:
@@ -141,6 +144,33 @@ class MessageOut(BaseModel):
 
 class MessagesListResponse(BaseModel):
     messages: list[MessageOut]
+
+
+class MessagePendingModerationOut(BaseModel):
+    """Ответ на /messages/send, когда исходящая эвристика вернула THREAT
+    хотя бы для одного события — сообщение НЕ доставлено, удержано в
+    core/moderation_store.py до решения человека (см. обсуждение в чате,
+    пункт 2)."""
+
+    status: str = "pending_moderation"
+    hold_id: str
+    threat_reasons: list[str]
+
+
+class PendingModerationOut(BaseModel):
+    hold_id: str
+    message: MessageOut
+    threat_reasons: list[str]
+    held_at: float
+
+
+class ModerationQueueResponse(BaseModel):
+    pending: list[PendingModerationOut]
+
+
+class ModerationResolveResponse(BaseModel):
+    status: str
+    message: MessageOut
 
 
 class CreateOrgRequest(BaseModel):
@@ -279,9 +309,25 @@ async def delete_contact(contact_id: str, current_user: User = Depends(get_curre
 # не знает о DLP (mimir_architecture_v2.md §4). После успешной отправки
 # эндпоинт (не сам messages_store!) вызывает core/message_bridge.py —
 # единственный модуль, которому разрешено видеть транспорт, auth и org
-# одновременно — и сохраняет результат через core/dlp_events_store.py.
-# Сбой моста (BridgeError) логируется, но не должен ронять уже
-# состоявшуюся отправку сообщения — см. обсуждение в чате.
+# одновременно — классифицирует каждое событие через core/dlp_heuristics.py
+# и сохраняет результат через core/dlp_events_store.py. Сбой моста
+# (BridgeError) логируется, но не должен ронять уже состоявшуюся отправку
+# сообщения — см. обсуждение в чате.
+#
+# THREAT для ИСХОДЯЩЕЙ проверки (утечка от сотрудника) — сообщение не
+# доставляется сразу, но и не отбрасывается: удерживается в
+# core/moderation_store.py до решения человека (см. обсуждение в чате,
+# пункт 2 — не автономная блокировка без пути назад, и не молчаливая
+# пометка постфактум). Для ВХОДЯЩЕЙ проверки такое решение не обсуждалось
+# и не принято — THREAT там пока только классифицируется и сохраняется в
+# dlp_events_store, доставка не блокируется (сообщение и раньше доставлялось
+# при сбое самой проверки, fail-open) — если нужно то же удержание для
+# входящих (фишинг), это отдельное решение, TODO.
+#
+# TODO (роли, MIMIR_development_plan.md недели 5-6): /moderation/* сейчас
+# доступны любому аутентифицированному пользователю — роль "офицер
+# безопасности" ещё не спроектирована ни в auth_store.py, ни в org_store.py.
+# Ограничить доступ, когда роли появятся.
 #
 # /messages/send принимает multipart/form-data, а не JSON — вложения
 # идут как настоящие файлы (UploadFile), без base64-раздувания.
@@ -293,7 +339,7 @@ def _message_to_out(message: Message) -> MessageOut:
     return MessageOut(**message.to_public_dict())
 
 
-@app.post("/messages/send", response_model=MessageOut)
+@app.post("/messages/send", response_model=MessageOut | MessagePendingModerationOut)
 async def send_message(
     recipient_ids: list[str] = Form(...),
     text: str = Form(""),
@@ -314,14 +360,17 @@ async def send_message(
     except MessagesError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    dlp_checks = []
+    # (check, classifications) пары — classify() вызывается здесь, снаружи
+    # dlp_events_store.py (см. обсуждение в чате, пункт 1.1 — стор ничего
+    # не решает и не вычисляет сам).
+    dlp_checks: list[tuple] = []
 
-    # Исходящая — fail-closed. Ядро продукта (утечка от сотрудника): если
-    # проверка не отработала, сообщение НЕ сохраняется и не доставляется
-    # вообще никому, даже настоящим получателям (см. обсуждение в чате —
-    # нет бытового эквивалента "я и так терплю этот риск" для утечки).
-    # check_outgoing() сама возвращает None для личных/standalone
-    # аккаунтов — для них этот блок никогда не бросает и не блокирует.
+    # Исходящая — fail-closed на СБОЕ проверки (ядро продукта, утечка от
+    # сотрудника): если проверка не отработала, сообщение НЕ сохраняется и
+    # не доставляется вообще никому (нет бытового эквивалента "я и так
+    # терплю этот риск" для утечки). check_outgoing() сама возвращает None
+    # для личных/standalone аккаунтов — для них этот блок не бросает и не
+    # блокирует.
     try:
         outgoing_check = check_outgoing(message, org_store, auth_store, contacts_store)
     except Exception:
@@ -333,26 +382,96 @@ async def send_message(
             status_code=503,
             detail="Проверка сообщения временно недоступна, попробуйте ещё раз",
         )
-    if outgoing_check is not None:
-        dlp_checks.append(outgoing_check)
 
-    # Входящая — fail-open. Защита получателя от фишинга сверх базового
-    # уровня: если проверка не отработала, сообщение всё равно доставляется
-    # как обычно — откат к риску обычного непроверяемого мессенджера,
-    # а не новая уязвимость (см. обсуждение в чате).
+    if outgoing_check is not None:
+        outgoing_classifications = [classify(event) for event in outgoing_check.events]
+        # Событие/классификацию сохраняем В ЛЮБОМ СЛУЧАЕ, даже если ниже
+        # сообщение уйдёт на модерацию — это данные для будущего датасета
+        # (неделя 7), не зависят от того, доставлено сообщение или нет.
+        dlp_events_store.add_check(message.message_id, outgoing_check, outgoing_classifications)
+
+        threat_reasons = [
+            reason
+            for result in outgoing_classifications
+            for reason in result.threat_reasons
+            if result.level == ThreatLevel.THREAT
+        ]
+        if threat_reasons:
+            # THREAT на исходящем -> не store(), удерживаем на модерации
+            # (см. комментарий над эндпоинтом). message уже построен
+            # (build_message), но ещё не сохранён — значит его до сих пор
+            # никто не видит ни в inbox(), ни в history().
+            pending = moderation_store.hold(message, threat_reasons)
+            return MessagePendingModerationOut(
+                hold_id=pending.hold_id, threat_reasons=threat_reasons,
+            )
+
+    # Входящая — fail-open на СБОЕ проверки. Защита получателя от фишинга
+    # сверх базового уровня: если проверка не отработала, сообщение всё
+    # равно доставляется как обычно — откат к риску обычного
+    # непроверяемого мессенджера, а не новая уязвимость. THREAT-результат
+    # входящей проверки здесь пока НЕ блокирует доставку (см. TODO выше).
     try:
-        dlp_checks.extend(check_incoming(message, auth_store, contacts_store))
+        incoming_checks = check_incoming(message, auth_store, contacts_store)
     except Exception:
+        incoming_checks = []
         logger.exception(
             "Входящая DLP-проверка сообщения %s провалилась — сообщение "
             "всё равно будет доставлено (fail-open)", message.message_id,
         )
+    for check in incoming_checks:
+        dlp_checks.append((check, [classify(event) for event in check.events]))
 
     messages_store.store(message)
-    for check in dlp_checks:
-        dlp_events_store.add_check(message.message_id, check)
+    for check, classifications in dlp_checks:
+        dlp_events_store.add_check(message.message_id, check, classifications)
 
     return _message_to_out(message)
+
+
+@app.get("/moderation/pending", response_model=ModerationQueueResponse)
+async def moderation_pending(current_user: User = Depends(get_current_user)):
+    """Очередь сообщений, удержанных из-за THREAT на исходящей проверке.
+    Разбор ЕДИНИЧНЫЙ по карточкам (в отличие от ANOMALY-сводки — см.
+    обсуждение в чате, пункт про масштаб на 1000 сотрудников): THREAT
+    рассчитан на редкие самодостаточные сигналы, каждый требует решения
+    человека по отдельности, не пачкой."""
+    pending = moderation_store.list_pending()
+    return ModerationQueueResponse(
+        pending=[
+            PendingModerationOut(
+                hold_id=p.hold_id,
+                message=_message_to_out(p.message),
+                threat_reasons=p.threat_reasons,
+                held_at=p.held_at,
+            )
+            for p in pending
+        ]
+    )
+
+
+@app.post("/moderation/{hold_id}/approve", response_model=ModerationResolveResponse)
+async def moderation_approve(hold_id: str, current_user: User = Depends(get_current_user)):
+    """Человек подтвердил, что сообщение можно доставить (ложное
+    срабатывание эвристики) — снимает с модерации и ТОЛЬКО теперь
+    вызывает messages_store.store(), делая сообщение видимым получателю."""
+    try:
+        message = moderation_store.resolve(hold_id)
+    except ModerationError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    messages_store.store(message)
+    return ModerationResolveResponse(status="approved", message=_message_to_out(message))
+
+
+@app.post("/moderation/{hold_id}/reject", response_model=ModerationResolveResponse)
+async def moderation_reject(hold_id: str, current_user: User = Depends(get_current_user)):
+    """Человек подтвердил угрозу — снимает с модерации и НЕ вызывает
+    store(): сообщение никогда не становится видимым получателю."""
+    try:
+        message = moderation_store.resolve(hold_id)
+    except ModerationError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return ModerationResolveResponse(status="rejected", message=_message_to_out(message))
 
 
 @app.get("/messages/history/{other_user_id}", response_model=MessagesListResponse)
