@@ -31,12 +31,15 @@ is_known_contact, домен для watchlist-проверки) устроен �
 DLPCheck при этом остаётся внутренним user_id — это стабильный ключ,
 по которому в будущем будут связываться события с аккаунтом.
 
-Дальше результата (list[DLPEvent]) этот модуль не идёт. Кодирование в
+Дальше результата (list[DLPEvent]) этот модуль не идёт — кодирование в
 вектор признаков (core/dlp_features.encode_event) и классификация
-(models/local_model.EventClassifier) — следующий шаг отдельно; хранилища
-для DLPEvent пока тоже нет (тот же долг, что и раньше — EventClassifier
-работает на заглушечных весах). Задача моста — только правильно решить,
-"проверять или нет" и в каком направлении, и корректно переупаковать формат.
+(core/dlp_heuristics.classify(), сейчас; models/local_model.EventClassifier
+на обученных весах — позже) происходят в api/server.py, результат уходит
+в core/dlp_events_store.py. Задача моста — только правильно решить,
+"проверять или нет" и в каком направлении, собрать ParserLookups из всех
+источников, которые сейчас подключены (contacts_store, watchlist_store,
+access_store — см. _lookups_for ниже; HR всё ещё не подключена, план
+отложен, см. MIMIR_development_plan.md), и корректно переупаковать формат.
 """
 
 from __future__ import annotations
@@ -52,7 +55,9 @@ from core.message_parser import (
     ParserLookups,
     RawAttachment,
     RawMessage,
+    make_lookups_from_access_store,
     make_lookups_from_contacts_store,
+    make_lookups_from_watchlist_store,
     parse_raw_message,
 )
 from core.messages_store import Attachment, Message
@@ -110,10 +115,56 @@ def _resolve_recipients(auth_store: AuthStore, message: Message) -> dict[str, st
     return recipient_emails
 
 
-def _lookups_for(contacts_store, subject_user_id: str) -> ParserLookups:
-    if contacts_store is None:
-        return DEFAULT_LOOKUPS
-    return make_lookups_from_contacts_store(contacts_store, subject_user_id)
+def _lookups_for(
+    contacts_store,
+    watchlist_store,
+    access_store,
+    org_id: str | None,
+    subject_user_id: str,
+) -> ParserLookups:
+    """Собирает ParserLookups из всех источников, которые сейчас
+    подключены. Каждый источник расширяет свой набор полей независимо
+    от остальных (contacts -> is_known_contact, watchlist ->
+    is_domain_watchlisted/is_link_whitelisted, access ->
+    is_device_registered/has_legitimate_access/has_elevated_rights) —
+    поля, для которых источника нет, остаются на нейтральном дефолте
+    DEFAULT_LOOKUPS. Со всеми тремя базами (watchlist + access), которые
+    зафиксированы в mimir_architecture_v2.md §7, долг закрыт целиком,
+    кроме HR (см. обсуждение в чате — отложено).
+
+    org_id может быть None (личный/standalone аккаунт без организации) —
+    в этом случае watchlist- и access-поля остаются нейтральными, ровно
+    как для contacts_store=None."""
+    is_known_contact = DEFAULT_LOOKUPS.is_known_contact
+    if contacts_store is not None:
+        is_known_contact = make_lookups_from_contacts_store(
+            contacts_store, subject_user_id
+        ).is_known_contact
+
+    is_domain_watchlisted = DEFAULT_LOOKUPS.is_domain_watchlisted
+    is_link_whitelisted = DEFAULT_LOOKUPS.is_link_whitelisted
+    if watchlist_store is not None and org_id is not None:
+        watchlist_lookups = make_lookups_from_watchlist_store(watchlist_store, org_id)
+        is_domain_watchlisted = watchlist_lookups.is_domain_watchlisted
+        is_link_whitelisted = watchlist_lookups.is_link_whitelisted
+
+    is_device_registered = DEFAULT_LOOKUPS.is_device_registered
+    has_legitimate_access = DEFAULT_LOOKUPS.has_legitimate_access
+    has_elevated_rights = DEFAULT_LOOKUPS.has_elevated_rights
+    if access_store is not None and org_id is not None:
+        access_lookups = make_lookups_from_access_store(access_store, org_id, subject_user_id)
+        is_device_registered = access_lookups.is_device_registered
+        has_legitimate_access = access_lookups.has_legitimate_access
+        has_elevated_rights = access_lookups.has_elevated_rights
+
+    return ParserLookups(
+        is_known_contact=is_known_contact,
+        is_domain_watchlisted=is_domain_watchlisted,
+        is_link_whitelisted=is_link_whitelisted,
+        is_device_registered=is_device_registered,
+        has_legitimate_access=has_legitimate_access,
+        has_elevated_rights=has_elevated_rights,
+    )
 
 
 def check_outgoing(
@@ -121,6 +172,8 @@ def check_outgoing(
     org_store: OrgStore,
     auth_store: AuthStore,
     contacts_store=None,
+    watchlist_store=None,
+    access_store=None,
 ) -> DLPCheck | None:
     """Исходящая проверка — утечка конфиденциальных данных от сотрудника.
     Срабатывает, только если у отправителя активное (approved) членство в
@@ -134,7 +187,8 @@ def check_outgoing(
     бытового эквивалента "я и так терплю этот риск" — без Mimir утечку
     через сотрудника никто не ловит вообще, в отличие от фишинга ниже.
     """
-    if not org_store.is_dlp_active(message.sender_id):
+    membership = org_store.get_active_membership(message.sender_id)
+    if membership is None:
         return None
 
     sender_email = _resolve_email(auth_store, message.sender_id)
@@ -147,15 +201,22 @@ def check_outgoing(
         text=message.text,
         attachments=[_to_raw_attachment(a) for a in message.attachments],
         sent_at=_to_datetime(message.sent_at),
+        device_id=message.device_id,  # сотрудник = отправитель здесь, устройство совпадает
     )
-    events = parse_raw_message(raw, _lookups_for(contacts_store, message.sender_id))
+    lookups = _lookups_for(
+        contacts_store, watchlist_store, access_store, membership.org_id, message.sender_id
+    )
+    events = parse_raw_message(raw, lookups)
     return DLPCheck(subject_user_id=message.sender_id, is_incoming=False, events=events)
 
 
 def check_incoming(
     message: Message,
     auth_store: AuthStore,
+    org_store: OrgStore,
     contacts_store=None,
+    watchlist_store=None,
+    access_store=None,
 ) -> list[DLPCheck]:
     """Входящая проверка — фишинг/вредоносные вложения. Срабатывает ВСЕГДА,
     для каждого получателя, независимо от типа аккаунта (в т.ч. личный
@@ -168,6 +229,13 @@ def check_incoming(
     отсюда не должно останавливать отправку, только логироваться. Откат
     при сбое — это откат к уровню риска обычного Telegram, а не новая
     уязвимость (см. обсуждение в чате).
+
+    org_store здесь только для резолва org_id каждого получателя (чтобы
+    подставить его watchlist) — направление всё равно проверяется
+    безусловно (см. выше), в отличие от check_outgoing() это НЕ гейтинг
+    "проверять или нет". У получателя без организации (personal Mimir)
+    get_active_membership() вернёт None — watchlist-поля для него
+    остаются нейтральными, проверка всё равно выполняется.
     """
     sender_email = _resolve_email(auth_store, message.sender_id)
     recipient_emails = _resolve_recipients(auth_store, message)
@@ -183,8 +251,18 @@ def check_incoming(
             text=message.text,
             attachments=attachments,
             sent_at=sent_at,
+            # device_id НЕ пробрасывается: message.device_id — устройство
+            # ОТПРАВИТЕЛЯ (контрагента/атакующего), а не получателя-
+            # сотрудника (employee_address здесь), чьё устройство и есть
+            # единственное осмысленное для проверки регистрации — см.
+            # docstring core/message_parser.RawMessage.device_id. Данных
+            # об устройстве получателя в этом запросе нет вообще, поэтому
+            # оставляем None -> признак остаётся нейтральным.
         )
-        events = parse_raw_message(raw, _lookups_for(contacts_store, recipient_id))
+        membership = org_store.get_active_membership(recipient_id)
+        org_id = membership.org_id if membership is not None else None
+        lookups = _lookups_for(contacts_store, watchlist_store, access_store, org_id, recipient_id)
+        events = parse_raw_message(raw, lookups)
         checks.append(DLPCheck(subject_user_id=recipient_id, is_incoming=True, events=events))
 
     return checks
@@ -195,14 +273,20 @@ def check_message(
     org_store: OrgStore,
     auth_store: AuthStore,
     contacts_store=None,
+    watchlist_store=None,
+    access_store=None,
 ) -> list[DLPCheck]:
     """Удобный шорткат check_outgoing()+check_incoming() одним вызовом и
     одной политикой отказа — для мест, где различие fail-open/fail-closed
     по направлению не нужно (например, тесты). В api/server.py используются
     check_outgoing()/check_incoming() по отдельности — см. их docstring."""
     checks: list[DLPCheck] = []
-    outgoing = check_outgoing(message, org_store, auth_store, contacts_store)
+    outgoing = check_outgoing(
+        message, org_store, auth_store, contacts_store, watchlist_store, access_store
+    )
     if outgoing is not None:
         checks.append(outgoing)
-    checks.extend(check_incoming(message, auth_store, contacts_store))
+    checks.extend(
+        check_incoming(message, auth_store, org_store, contacts_store, watchlist_store, access_store)
+    )
     return checks

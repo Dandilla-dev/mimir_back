@@ -8,12 +8,20 @@ core/message_parser.py — парсер "сырое сообщение месс�
 уметь превращать своё внутреннее сообщение в RawMessage перед вызовом
 parse_raw_message().
 
-Признаки, для которых источника данных пока нет (HR-справочник, список
-наблюдаемых доменов, реестр устройств, роли доступа) — подставляются
-нейтральным значением 0/False до появления соответствующих баз данных
-(решение зафиксировано 2026-09-02, см. mimir_architecture_v2.md §7).
-Продукт не выходит в реальную эксплуатацию, пока эти базы не готовы хотя бы
-в минимальном виде — на этот период значения по умолчанию условны.
+Признаки, зависящие от трёх баз, зафиксированных как долг в
+mimir_architecture_v2.md §7 (список наблюдаемых доменов, реестр
+устройств, роли доступа) — подставляются нейтральным значением 0/False
+ТОЛЬКО когда соответствующий стор не подключён к ParserLookups (личные/
+standalone аккаунты без организации, либо org_id не резолвится в точке
+вызова) — см. make_lookups_from_watchlist_store()/
+make_lookups_from_access_store() ниже и core/message_bridge._lookups_for().
+Статус на 2026-09-16: watchlist доменов (core/watchlist_store.py) и
+устройства+роли (core/access_store.py) реализованы и подключены — долг
+по ним закрыт минимально, как и планировалось (mimir_architecture_v2.md
+§7: "продукт не выходит в реальную эксплуатацию, пока эти базы не готовы
+хотя бы в минимальном виде"). HR-справочник (near_termination,
+on_official_leave — блок 3) по-прежнему не реализован, решение
+2026-09-01 (MIMIR_development_plan.md) — отложен за пилот, не блокирует.
 
 Групповые сообщения: один RawMessage с несколькими получателями порождает
 по одному DLPEvent на каждого получателя-контрагента (кроме самого
@@ -55,6 +63,17 @@ class RawMessage:
     text: str = ""
     attachments: list[RawAttachment] = field(default_factory=list)
     sent_at: datetime = field(default_factory=datetime.now)
+    device_id: str | None = None
+    """Устройство СОТРУДНИКА (employee_address), а не устройство "стороны,
+    которая физически прислала этот RawMessage" — для исходящих это одно и
+    то же (сотрудник и есть отправитель), но для входящих это НЕ device_id
+    отправителя-контрагента (см. core/message_bridge.py: там сознательно
+    не пробрасывается Message.device_id во входящую проверку, потому что
+    там device_id принадлежит атакующему/контрагенту, а не получателю-
+    сотруднику, чьё устройство единственное имеет смысл проверять на
+    регистрацию). None — данных нет (клиент не прислал/не применимо для
+    этого направления) -> признак остаётся нейтральным, см.
+    parse_raw_message() ниже, а не трактуется как "не зарегистрировано"."""
 
 
 # ---------------------------------------------------------------------------
@@ -69,17 +88,18 @@ class ParserLookups:
 
     Дефолты соответствуют решению "0 до готовности баз" — см. docstring
     модуля. Реальные реализации подключаются извне (см.
-    make_lookups_from_contacts_store ниже — единственный источник,
-    который уже есть).
+    make_lookups_from_contacts_store/make_lookups_from_watchlist_store/
+    make_lookups_from_access_store ниже — HR пока не реализована, для
+    is_internal_employee фабрики нет).
     """
 
     is_known_contact: Callable[[str], bool] = lambda address: False
-    is_internal_employee: Callable[[str], bool] = lambda address: True  # ждёт HR, дефолт "внутри" = 0 = тихо
-    is_domain_watchlisted: Callable[[str], bool] = lambda domain: False  # ждёт список доменов
-    is_link_whitelisted: Callable[[str], bool] = lambda domain: True  # ждёт белый список
-    is_device_registered: Callable[[str], bool] = lambda device_id: True  # ждёт реестр устройств
-    has_legitimate_access: Callable[[str, str], bool] = lambda user, resource: True  # ждёт роли
-    has_elevated_rights: Callable[[str], bool] = lambda user: False  # ждёт роли
+    is_internal_employee: Callable[[str], bool] = lambda address: True  # ждёт HR (не реализована), дефолт "внутри" = 0 = тихо
+    is_domain_watchlisted: Callable[[str], bool] = lambda domain: False  # нейтрален, если watchlist_store не подключён (см. core/watchlist_store.py)
+    is_link_whitelisted: Callable[[str], bool] = lambda domain: True  # нейтрален, если watchlist_store не подключён
+    is_device_registered: Callable[[str], bool] = lambda device_id: True  # нейтрален, если access_store не подключён (см. core/access_store.py)
+    has_legitimate_access: Callable[[str, str], bool] = lambda user, resource: True  # нейтрален, если access_store не подключён
+    has_elevated_rights: Callable[[str], bool] = lambda user: False  # нейтрален, если access_store не подключён
 
 
 def make_lookups_from_contacts_store(contacts_store, owner_user_id: str) -> ParserLookups:
@@ -93,6 +113,53 @@ def make_lookups_from_contacts_store(contacts_store, owner_user_id: str) -> Pars
         if c.email
     }
     return ParserLookups(is_known_contact=lambda address: address.lower() in known_emails)
+
+
+def make_lookups_from_watchlist_store(watchlist_store, org_id: str) -> ParserLookups:
+    """Watchlist доменов + белый список ссылок — первая из трёх баз,
+    закрывающих долг mimir_architecture_v2.md §7 (см. docstring
+    core/watchlist_store.py). org_id фиксирован в замыкании тем же
+    способом, что owner_user_id в make_lookups_from_contacts_store —
+    один WatchlistStore инстанс обслуживает все организации разом,
+    изоляция данных клиента достигается тем, что каждый вызов здесь
+    привязан к одному конкретному org_id.
+    """
+    return ParserLookups(
+        is_domain_watchlisted=lambda domain: watchlist_store.is_domain_watchlisted(org_id, domain),
+        is_link_whitelisted=lambda domain: watchlist_store.is_link_whitelisted(org_id, domain),
+    )
+
+
+def make_lookups_from_access_store(access_store, org_id: str, subject_user_id: str) -> ParserLookups:
+    """Устройства + роли — третья и последняя из трёх баз, закрывающих
+    долг mimir_architecture_v2.md §7 (см. docstring core/access_store.py).
+
+    has_legitimate_access/has_elevated_rights ИГНОРИРУЮТ аргумент `user`,
+    который им передаёт message_parser.py (это message.employee_address —
+    EMAIL), и вместо этого используют subject_user_id, зафиксированный в
+    замыкании: гранты в core/access_store.py заведены по внутреннему
+    user_id (тот же canonical id, что в org_store/isolation_store/
+    moderation_store), а не по email. Раньше здесь была реальная ошибка
+    рассинхрона пространств идентификаторов (нашлась на тестировании
+    2026-09-16, тот же класс проблемы, что и device_id до этого) —
+    subject_user_id уже известен в точке вызова (message_bridge._lookups_for
+    получает его от check_outgoing()/check_incoming()), поэтому подмена
+    безопасна и однозначна: за один вызов parse_raw_message() "сотрудник"
+    всегда один и тот же человек, а не переменная сторона, как контрагент.
+
+    has_legitimate_access игнорирует ещё и resource целиком (сигнатура
+    ParserLookups не меняется — resource остаётся вторым аргументом, но
+    здесь не используется): по уточнению 2026-09-16 "легитимный доступ" —
+    это согласованный security_officer доступ сотрудника к данным
+    организации в целом, не per-контрагент/per-дело грант (такого понятия
+    в системе нет)."""
+    return ParserLookups(
+        is_device_registered=lambda device_id: access_store.is_device_registered(org_id, device_id),
+        has_legitimate_access=lambda user, resource: access_store.has_legitimate_access(
+            org_id, subject_user_id
+        ),
+        has_elevated_rights=lambda user: access_store.has_elevated_rights(org_id, subject_user_id),
+    )
 
 
 DEFAULT_LOOKUPS = ParserLookups()
@@ -131,8 +198,8 @@ _CONFIDENTIALITY_PATTERN = re.compile(
 _URL_PATTERN = re.compile(r"https?://([^\s/]+)", re.IGNORECASE)
 
 # Домены, повсеместно ассоциируемые с публичными файлообменниками —
-# отдельно от списка watchlist-доменов (которого пока нет как базы),
-# это узкий и стабильный список, не требующий отдельной БД.
+# отдельно от списка watchlist-доменов (ведётся отдельной базой,
+# core/watchlist_store.py, с 2026-09-16), это узкий и стабильный список, не требующий отдельной БД.
 _FILE_SHARING_DOMAINS = {
     "wetransfer.com", "mega.nz", "mediafire.com", "sendspace.com",
     "dropbox.com", "drive.google.com",
@@ -293,7 +360,10 @@ def parse_raw_message(
                 is_non_working_day=is_non_working_day,
                 near_termination=None,   # ждёт HR-интеграции
                 on_official_leave=None,  # ждёт HR-интеграции
-                device_unregistered=not lookups.is_device_registered(message.employee_address),
+                device_unregistered=(
+                    message.device_id is not None
+                    and not lookups.is_device_registered(message.device_id)
+                ),
                 lacks_legitimate_access=not lookups.has_legitimate_access(
                     message.employee_address, counterparty
                 ),

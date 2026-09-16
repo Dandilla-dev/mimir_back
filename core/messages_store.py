@@ -53,6 +53,7 @@ class Message:
     text: str
     attachments: list[Attachment] = field(default_factory=list)
     sent_at: float = field(default_factory=time.time)
+    device_id: str | None = None  # устройство ОТПРАВИТЕЛЯ на момент отправки, см. docstring build_message()
 
     def to_public_dict(self) -> dict:
         return {
@@ -62,6 +63,7 @@ class Message:
             "text": self.text,
             "attachments": [a.to_public_dict() for a in self.attachments],
             "sent_at": self.sent_at,
+            "device_id": self.device_id,
         }
 
 
@@ -85,13 +87,24 @@ class MessagesStore:
         recipient_ids: list[str],
         text: str = "",
         attachments: list[dict] | None = None,
+        device_id: str | None = None,
     ) -> Message:
         """Валидирует и строит Message, но НЕ сохраняет его — оно ещё не
         существует ни в одном индексе, значит его ещё никто не может
         увидеть через inbox()/conversation_history(). Использовать вместе
         со store(): построить -> дать вызывающей стороне шанс отказаться
         от сохранения (например, если DLP-проверка провалилась) -> store().
-        """
+
+        device_id — устройство ОТПРАВИТЕЛЯ на момент отправки (см.
+        Message.device_id). Раньше это поле существовало в Message, но
+        никогда не заполнялось по-настоящему — ни один вызывающий код
+        (включая API) не передавал его. Исправлено 2026-09-16: теперь
+        параметр реально принимается и доходит до message_bridge.py ->
+        message_parser.py (core/access_store.py, блок 5). None (по
+        умолчанию) — клиент не прислал идентификатор устройства, тогда
+        признак "устройство не зарегистрировано" остаётся нейтральным
+        (см. docstring core/message_parser.RawMessage.device_id), а не
+        трактуется как "не зарегистрировано"."""
         recipient_ids = [r for r in recipient_ids if r != sender_id]
         if not recipient_ids:
             raise MessagesError("Нужен хотя бы один получатель, отличный от отправителя")
@@ -111,6 +124,7 @@ class MessagesStore:
                 )
                 for a in (attachments or [])
             ],
+            device_id=device_id,
         )
 
     def store(self, message: Message) -> None:
@@ -134,10 +148,11 @@ class MessagesStore:
         recipient_ids: list[str],
         text: str = "",
         attachments: list[dict] | None = None,
+        device_id: str | None = None,
     ) -> Message:
         """Удобный шорткат build_message()+store() одним вызовом — для
         случаев, где отдельный шаг проверки между ними не нужен."""
-        message = self.build_message(sender_id, recipient_ids, text, attachments)
+        message = self.build_message(sender_id, recipient_ids, text, attachments, device_id)
         self.store(message)
         return message
 

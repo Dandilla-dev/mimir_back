@@ -25,6 +25,8 @@ from core.dlp_events_store import DLPEventsStore
 from core.dlp_heuristics import ThreatLevel, classify
 from core.moderation_store import ModerationError, ModerationStore
 from core.isolation_store import IsolationError, IsolationStore
+from core.watchlist_store import WatchlistError, WatchlistStore
+from core.access_store import AccessError, AccessStore
 from core.message_parser import is_audio_attachment, contains_link
 
 logging.basicConfig(level=logging.INFO)
@@ -49,6 +51,8 @@ org_store = OrgStore()
 dlp_events_store = DLPEventsStore()
 moderation_store = ModerationStore()
 isolation_store = IsolationStore()
+watchlist_store = WatchlistStore()
+access_store = AccessStore()
 
 
 def get_current_user(authorization: str | None = Header(default=None)) -> User:
@@ -143,6 +147,7 @@ class MessageOut(BaseModel):
     text: str
     attachments: list[AttachmentOut]
     sent_at: float
+    device_id: str | None = None
 
 
 class MessagesListResponse(BaseModel):
@@ -236,6 +241,75 @@ class MembershipOut(BaseModel):
 
 class MembershipsListResponse(BaseModel):
     memberships: list[MembershipOut]
+
+
+class AddDomainRequest(BaseModel):
+    domain: str = Field(..., min_length=1)
+    reason: str = ""
+
+
+class WatchlistDomainOut(BaseModel):
+    entry_id: str
+    org_id: str
+    domain: str
+    reason: str
+    added_by: str
+    added_at: float
+
+
+class WatchlistListResponse(BaseModel):
+    domains: list[WatchlistDomainOut]
+
+
+class WhitelistDomainOut(BaseModel):
+    entry_id: str
+    org_id: str
+    domain: str
+    reason: str
+    added_by: str
+    added_at: float
+
+
+class WhitelistListResponse(BaseModel):
+    domains: list[WhitelistDomainOut]
+
+
+class RegisterDeviceRequest(BaseModel):
+    device_id: str = Field(..., min_length=1)
+    user_id: str = Field(..., min_length=1)
+    label: str = ""
+
+
+class DeviceOut(BaseModel):
+    entry_id: str
+    org_id: str
+    device_id: str
+    user_id: str
+    label: str
+    registered_by: str
+    registered_at: float
+
+
+class DevicesListResponse(BaseModel):
+    devices: list[DeviceOut]
+
+
+class GrantAccessRequest(BaseModel):
+    user_id: str = Field(..., min_length=1)
+    note: str = ""
+
+
+class AccessGrantOut(BaseModel):
+    entry_id: str
+    org_id: str
+    user_id: str
+    granted_by: str
+    note: str
+    granted_at: float
+
+
+class AccessGrantsListResponse(BaseModel):
+    grants: list[AccessGrantOut]
 
 
 # --------- REST эндпоинты ---------
@@ -400,12 +474,13 @@ def _message_to_out(message: Message) -> MessageOut:
 def _require_not_isolated(current_user: User) -> None:
     """Изолированный аккаунт теряет доступ не только к отправке файлов/
     ссылок (см. проверку в send_message() ниже), но и к данным
-    организации — см. обсуждение в чате. Сейчас в проекте это ЕДИНСТВЕННЫЙ
-    такой ресурс: GET /orgs/{org_id}/pending (список заявок на членство).
-    Общих документов/базы контактов и т.п. на уровне организации в
-    проекте пока нет (contacts_store.py/messages_store.py/memory.py —
-    всё персональное, к org_id не привязано) — когда такие ресурсы
-    появятся, гейтить их тем же способом."""
+    организации — см. обсуждение в чате. Ресурсы уровня организации,
+    гейтящиеся этим способом (обновлено 2026-09-16, список рос по мере
+    появления org-данных): GET /orgs/{org_id}/pending (заявки на
+    членство), watchlist/link-whitelist доменов и устройства/роли доступа
+    (см. _require_security_officer ниже — она сама вызывает эту функцию
+    первым делом). Личные данные (contacts_store.py/messages_store.py/
+    memory.py) по-прежнему не org-scoped и сюда не входят."""
     if isolation_store.is_isolated(current_user.user_id):
         raise HTTPException(
             status_code=403,
@@ -464,6 +539,7 @@ async def send_message(
     recipient_ids: list[str] = Form(...),
     text: str = Form(""),
     files: list[UploadFile] = File(default=[]),
+    device_id: str | None = Form(default=None),
     current_user: User = Depends(get_current_user),
 ):
     attachments = [
@@ -504,6 +580,7 @@ async def send_message(
             recipient_ids=recipient_ids,
             text=text,
             attachments=attachments,
+            device_id=device_id,
         )
     except MessagesError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -520,7 +597,9 @@ async def send_message(
     # для личных/standalone аккаунтов — для них этот блок не бросает и не
     # блокирует.
     try:
-        outgoing_check = check_outgoing(message, org_store, auth_store, contacts_store)
+        outgoing_check = check_outgoing(
+            message, org_store, auth_store, contacts_store, watchlist_store, access_store
+        )
     except Exception:
         logger.exception(
             "Исходящая DLP-проверка сообщения %s провалилась — сообщение "
@@ -560,7 +639,9 @@ async def send_message(
     # непроверяемого мессенджера, а не новая уязвимость. THREAT-результат
     # входящей проверки здесь пока НЕ блокирует доставку (см. TODO выше).
     try:
-        incoming_checks = check_incoming(message, auth_store, contacts_store)
+        incoming_checks = check_incoming(
+            message, auth_store, org_store, contacts_store, watchlist_store, access_store
+        )
     except Exception:
         incoming_checks = []
         logger.exception(
@@ -817,6 +898,22 @@ async def message_inbox(current_user: User = Depends(get_current_user)):
 # и отдают факт привязки. Решение "проверять ли это исходящее сообщение"
 # принимает мост (ещё не реализован), опираясь на org_store.is_dlp_active().
 
+def _require_security_officer(org_id: str, current_user: User) -> None:
+    """Гейтинг для org-scoped ресурсов DLP-баз: watchlist/link-whitelist
+    доменов (core/watchlist_store.py) и устройства/роли доступа
+    (core/access_store.py) — та же роль, что уже переиспользуется для
+    всего DLP-контура (mimir_architecture_v2.md,
+    org_store.MembershipRole.SECURITY_OFFICER, без отдельной DLP-роли).
+    Изолированный аккаунт тоже не должен менять org-данные — см.
+    _require_not_isolated."""
+    _require_not_isolated(current_user)
+    if not org_store.is_security_officer(current_user.user_id, org_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Только security_officer этой организации может управлять списком доменов",
+        )
+
+
 def _org_to_out(org: Organization) -> OrgOut:
     return OrgOut(**org.to_public_dict())
 
@@ -884,6 +981,187 @@ async def reject_membership(
     except OrgError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     return _membership_to_out(membership)
+
+
+@app.post("/orgs/{org_id}/watchlist", response_model=WatchlistDomainOut)
+async def add_watchlisted_domain(
+    org_id: str, req: AddDomainRequest, current_user: User = Depends(get_current_user)
+):
+    """Блок 1 (mimir_dlp_features_v1.md) — домен под наблюдением: конкурент
+    для исходящих, известный источник фишинга для входящих. Только
+    security_officer организации — см. _require_security_officer."""
+    _require_security_officer(org_id, current_user)
+    try:
+        entry = watchlist_store.add_watchlisted(org_id, req.domain, current_user.user_id, req.reason)
+    except WatchlistError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return WatchlistDomainOut(**entry.to_public_dict())
+
+
+@app.get("/orgs/{org_id}/watchlist", response_model=WatchlistListResponse)
+async def list_watchlisted_domains(org_id: str, current_user: User = Depends(get_current_user)):
+    _require_security_officer(org_id, current_user)
+    domains = watchlist_store.list_watchlisted(org_id)
+    return WatchlistListResponse(domains=[WatchlistDomainOut(**e.to_public_dict()) for e in domains])
+
+
+@app.delete("/orgs/{org_id}/watchlist/{entry_id}")
+async def remove_watchlisted_domain(
+    org_id: str, entry_id: str, current_user: User = Depends(get_current_user)
+):
+    _require_security_officer(org_id, current_user)
+    try:
+        watchlist_store.remove_watchlisted(org_id, entry_id, current_user.user_id)
+    except WatchlistError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"status": "removed"}
+
+
+@app.get("/link-whitelist/default", response_model=list[str])
+async def default_whitelisted_link_domains(current_user: User = Depends(get_current_user)):
+    """Общий read-only список для всех организаций (см. docstring
+    core/watchlist_store.py, "проблема холодного старта") — фронтенду
+    нужен отдельно от org-специфичного /orgs/{org_id}/link-whitelist,
+    чтобы показать officer'у, что уже разрешено, а что можно добавить."""
+    return watchlist_store.list_default_whitelisted()
+
+
+@app.post("/orgs/{org_id}/link-whitelist", response_model=WhitelistDomainOut)
+async def add_whitelisted_link_domain(
+    org_id: str, req: AddDomainRequest, current_user: User = Depends(get_current_user)
+):
+    """Блок 2 (mimir_dlp_features_v1.md) — одобренный домен для внешних
+    ссылок в сообщениях. Полярность обратная watchlist: домен, НЕ
+    внесённый сюда, трактуется парсером как "не в белом списке" (см.
+    docstring core/watchlist_store.py)."""
+    _require_security_officer(org_id, current_user)
+    try:
+        entry = watchlist_store.add_whitelisted_link(org_id, req.domain, current_user.user_id, req.reason)
+    except WatchlistError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return WhitelistDomainOut(**entry.to_public_dict())
+
+
+@app.get("/orgs/{org_id}/link-whitelist", response_model=WhitelistListResponse)
+async def list_whitelisted_link_domains(org_id: str, current_user: User = Depends(get_current_user)):
+    _require_security_officer(org_id, current_user)
+    domains = watchlist_store.list_whitelisted(org_id)
+    return WhitelistListResponse(domains=[WhitelistDomainOut(**e.to_public_dict()) for e in domains])
+
+
+@app.delete("/orgs/{org_id}/link-whitelist/{entry_id}")
+async def remove_whitelisted_link_domain(
+    org_id: str, entry_id: str, current_user: User = Depends(get_current_user)
+):
+    _require_security_officer(org_id, current_user)
+    try:
+        watchlist_store.remove_whitelisted_link(org_id, entry_id, current_user.user_id)
+    except WatchlistError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"status": "removed"}
+
+
+# --------- Устройства + роли доступа (core/access_store.py, блоки 5 и 6) ---------
+
+
+@app.post("/orgs/{org_id}/devices", response_model=DeviceOut)
+async def register_device(
+    org_id: str, req: RegisterDeviceRequest, current_user: User = Depends(get_current_user)
+):
+    """Блок 5 — зарегистрированное рабочее устройство. Для пилота
+    регистрирует только security_officer (самостоятельная регистрация
+    сотрудником не предусмотрена, см. docstring core/access_store.py)."""
+    _require_security_officer(org_id, current_user)
+    try:
+        entry = access_store.register_device(
+            org_id, req.device_id, req.user_id, current_user.user_id, req.label
+        )
+    except AccessError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return DeviceOut(**entry.to_public_dict())
+
+
+@app.get("/orgs/{org_id}/devices", response_model=DevicesListResponse)
+async def list_devices(org_id: str, current_user: User = Depends(get_current_user)):
+    _require_security_officer(org_id, current_user)
+    devices = access_store.list_devices(org_id)
+    return DevicesListResponse(devices=[DeviceOut(**d.to_public_dict()) for d in devices])
+
+
+@app.delete("/orgs/{org_id}/devices/{entry_id}")
+async def unregister_device(org_id: str, entry_id: str, current_user: User = Depends(get_current_user)):
+    _require_security_officer(org_id, current_user)
+    try:
+        access_store.unregister_device(org_id, entry_id, current_user.user_id)
+    except AccessError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"status": "removed"}
+
+
+@app.post("/orgs/{org_id}/access/legitimate", response_model=AccessGrantOut)
+async def grant_legitimate_access(
+    org_id: str, req: GrantAccessRequest, current_user: User = Depends(get_current_user)
+):
+    """Блок 6 — согласованный security_officer доступ сотрудника к данным
+    организации (уточнено в чате 2026-09-16, см. docstring
+    core/access_store.py: грант на уровне сотрудника, не на конкретное
+    дело/контрагента — такого понятия в системе нет)."""
+    _require_security_officer(org_id, current_user)
+    try:
+        grant = access_store.grant_legitimate_access(org_id, req.user_id, current_user.user_id, req.note)
+    except AccessError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return AccessGrantOut(**grant.to_public_dict())
+
+
+@app.get("/orgs/{org_id}/access/legitimate", response_model=AccessGrantsListResponse)
+async def list_legitimate_access(org_id: str, current_user: User = Depends(get_current_user)):
+    _require_security_officer(org_id, current_user)
+    grants = access_store.list_legitimate_access(org_id)
+    return AccessGrantsListResponse(grants=[AccessGrantOut(**g.to_public_dict()) for g in grants])
+
+
+@app.delete("/orgs/{org_id}/access/legitimate/{entry_id}")
+async def revoke_legitimate_access(
+    org_id: str, entry_id: str, current_user: User = Depends(get_current_user)
+):
+    _require_security_officer(org_id, current_user)
+    try:
+        access_store.revoke_legitimate_access(org_id, entry_id, current_user.user_id)
+    except AccessError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"status": "removed"}
+
+
+@app.post("/orgs/{org_id}/access/elevated", response_model=AccessGrantOut)
+async def grant_elevated_rights(
+    org_id: str, req: GrantAccessRequest, current_user: User = Depends(get_current_user)
+):
+    _require_security_officer(org_id, current_user)
+    try:
+        grant = access_store.grant_elevated_rights(org_id, req.user_id, current_user.user_id, req.note)
+    except AccessError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return AccessGrantOut(**grant.to_public_dict())
+
+
+@app.get("/orgs/{org_id}/access/elevated", response_model=AccessGrantsListResponse)
+async def list_elevated_rights(org_id: str, current_user: User = Depends(get_current_user)):
+    _require_security_officer(org_id, current_user)
+    grants = access_store.list_elevated_rights(org_id)
+    return AccessGrantsListResponse(grants=[AccessGrantOut(**g.to_public_dict()) for g in grants])
+
+
+@app.delete("/orgs/{org_id}/access/elevated/{entry_id}")
+async def revoke_elevated_rights(
+    org_id: str, entry_id: str, current_user: User = Depends(get_current_user)
+):
+    _require_security_officer(org_id, current_user)
+    try:
+        access_store.revoke_elevated_rights(org_id, entry_id, current_user.user_id)
+    except AccessError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"status": "removed"}
 
 
 @app.get("/me/membership", response_model=MembershipOut | None)
