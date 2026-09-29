@@ -23,11 +23,11 @@ uvicorn api.server:app --host 0.0.0.0 --port 8000 --reload
 ## Эндпоинты
 
 - `GET  /health` — проверка живости и текущей модели
-- `POST /chat` — `{"session_id": "...", "message": "..."}` -> `{"reply": "..."}`
-- `POST /sensor-event` — `{"session_id": "...", "features": [0.1, 0.2, ...]}`
+- `POST /chat` — `{"message": "..."}` -> `{"reply": "..."}` (нужен `Authorization: Bearer <token>`; память разговора привязана к пользователю из токена)
+- `POST /sensor-event` — `{"features": [0.1, 0.2, ...]}` (нужен токен)
   -> классификация локальной сетью (+ анализ Claude при аномалии/угрозе)
-- `POST /session/{session_id}/reset` — очистить память сессии
-- `WS   /ws/chat/{session_id}` — потоковый чат (токен за токеном)
+- `POST /session/reset` — очистить память своего разговора (нужен токен)
+- `WS   /ws/chat` — потоковый чат; первым сообщением отправить `{"token": "..."}`, сервер ответит `{"event": "authenticated"}` (иначе закроет с кодом 1008)
 
 ## Структура
 

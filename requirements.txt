@@ -5,6 +5,7 @@ pydantic==2.9.2
 python-dotenv==1.0.1
 PyYAML==6.0.2
 email-validator==2.2.0
+python-multipart==0.0.9  # нужен FastAPI для Form/File в /messages/send (multipart/form-data)
 
 # Claude
 anthropic==0.34.2

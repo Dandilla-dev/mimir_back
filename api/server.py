@@ -8,6 +8,7 @@ api/server.py — FastAPI сервер, единая точка входа дл�
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
@@ -24,6 +25,9 @@ from core.message_bridge import check_incoming, check_outgoing
 from core.dlp_events_store import DLPEventsStore
 from core.dlp_heuristics import ThreatLevel, classify
 from core.moderation_store import ModerationError, ModerationStore
+from core.moderation_decisions_store import (
+    Decision, ModerationDecision, ModerationDecisionsStore, ReviewerConfidence,
+)
 from core.isolation_store import IsolationError, IsolationStore
 from core.watchlist_store import WatchlistError, WatchlistStore
 from core.access_store import AccessError, AccessStore
@@ -50,6 +54,7 @@ messages_store = MessagesStore()
 org_store = OrgStore()
 dlp_events_store = DLPEventsStore()
 moderation_store = ModerationStore()
+moderation_decisions_store = ModerationDecisionsStore()
 isolation_store = IsolationStore()
 watchlist_store = WatchlistStore()
 access_store = AccessStore()
@@ -69,18 +74,21 @@ def get_current_user(authorization: str | None = Header(default=None)) -> User:
 
 # --------- Схемы запросов/ответов ---------
 
+# session_id больше НЕ приходит от клиента (см. обсуждение в чате,
+# 2026-09-29): раньше клиент сам выбирал ключ памяти разговора и мог
+# подставить чужой — прочитать/стереть чужой диалог с Мимиром. Теперь
+# ключ памяти = user_id из токена (см. эндпоинты /chat, /sensor-event,
+# /session/reset и /ws/chat ниже).
+
 class ChatRequest(BaseModel):
-    session_id: str = Field(..., description="Идентификатор сессии/пользователя")
     message: str = Field(..., min_length=1)
 
 
 class ChatResponse(BaseModel):
-    session_id: str
     reply: str
 
 
 class SensorEventRequest(BaseModel):
-    session_id: str
     features: list[float]
 
 
@@ -176,9 +184,36 @@ class ModerationQueueResponse(BaseModel):
     pending: list[PendingModerationOut]
 
 
+class ModerationDecisionRequest(BaseModel):
+    """Необязательное тело approve/reject. Без тела (как раньше) —
+    reviewer_confidence = None. Самооценка проверяющего, не оценка
+    человека машиной (MIMIR_reviewer_consistency.md)."""
+
+    reviewer_confidence: ReviewerConfidence | None = None
+
+
 class ModerationResolveResponse(BaseModel):
     status: str
     message: MessageOut
+    decision_id: str
+
+
+class ModerationDecisionOut(BaseModel):
+    decision_id: str
+    hold_id: str
+    message_id: str
+    sender_id: str
+    org_id: str | None
+    decided_by: str
+    decision: str
+    reviewer_confidence: str | None
+    threat_reasons: list[str]
+    held_at: float
+    decided_at: float
+
+
+class ModerationDecisionsListResponse(BaseModel):
+    decisions: list[ModerationDecisionOut]
 
 
 class AnomalySubjectSummary(BaseModel):
@@ -320,19 +355,19 @@ async def health():
 
 
 @app.post("/chat", response_model=ChatResponse)
-async def chat(req: ChatRequest):
+async def chat(req: ChatRequest, current_user: User = Depends(get_current_user)):
     try:
-        reply = await mimir.chat(req.session_id, req.message)
+        reply = await mimir.chat(current_user.user_id, req.message)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Ошибка в /chat")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
-    return ChatResponse(session_id=req.session_id, reply=reply)
+    return ChatResponse(reply=reply)
 
 
 @app.post("/sensor-event", response_model=SensorEventResponse)
-async def sensor_event(req: SensorEventRequest):
+async def sensor_event(req: SensorEventRequest, current_user: User = Depends(get_current_user)):
     try:
-        result = await mimir.handle_sensor_event(req.session_id, req.features)
+        result = await mimir.handle_sensor_event(current_user.user_id, req.features)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Ошибка в /sensor-event")
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -344,10 +379,12 @@ async def sensor_event(req: SensorEventRequest):
     )
 
 
-@app.post("/session/{session_id}/reset")
-async def reset_session(session_id: str):
-    mimir.reset_session(session_id)
-    return {"status": "reset", "session_id": session_id}
+@app.post("/session/reset")
+async def reset_session(current_user: User = Depends(get_current_user)):
+    """Очищает память разговора с Мимиром ТЕКУЩЕГО пользователя — чужую
+    сессию сбросить больше нельзя (раньше session_id был в пути запроса)."""
+    mimir.reset_session(current_user.user_id)
+    return {"status": "reset"}
 
 
 # --------- Авторизация (заглушка: данные в памяти процесса) ---------
@@ -703,32 +740,92 @@ async def moderation_pending(current_user: User = Depends(get_current_user)):
     )
 
 
-@app.post("/moderation/{hold_id}/approve", response_model=ModerationResolveResponse)
-async def moderation_approve(hold_id: str, current_user: User = Depends(get_current_user)):
-    """Человек подтвердил, что сообщение можно доставить (ложное
-    срабатывание эвристики) — снимает с модерации и ТОЛЬКО теперь
-    вызывает messages_store.store(), делая сообщение видимым получателю."""
+def _resolve_hold(
+    hold_id: str,
+    decision: Decision,
+    req: ModerationDecisionRequest | None,
+    current_user: User,
+) -> tuple[Message, ModerationDecision]:
+    """Общая часть approve/reject: проверка прав -> снятие из очереди ->
+    запись решения в журнал (core/moderation_decisions_store.py).
+
+    Порядок важен: resolve() раньше record() — resolve() атомарно
+    убирает hold из очереди (dict.pop), поэтому второй officer, нажавший
+    одновременно, получит 404 на resolve() и НЕ запишет второе решение.
+    org_id берётся снимком на момент решения — членство отправителя
+    потом может измениться, решение должно остаться привязанным к той
+    организации, чей officer его принял."""
     try:
         pending = moderation_store.get(hold_id)  # без снятия из очереди — сперва право, потом resolve
     except ModerationError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     _require_moderation_access(pending.message, current_user)
-    message = moderation_store.resolve(hold_id)
+    try:
+        message = moderation_store.resolve(hold_id)
+    except ModerationError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    membership = org_store.get_active_membership(message.sender_id)
+    entry = moderation_decisions_store.record(
+        hold_id=pending.hold_id,
+        message_id=message.message_id,
+        sender_id=message.sender_id,
+        org_id=membership.org_id if membership else None,
+        decided_by=current_user.user_id,
+        decision=decision,
+        reviewer_confidence=req.reviewer_confidence if req else None,
+        threat_reasons=pending.threat_reasons,
+        held_at=pending.held_at,
+    )
+    return message, entry
+
+
+@app.post("/moderation/{hold_id}/approve", response_model=ModerationResolveResponse)
+async def moderation_approve(
+    hold_id: str,
+    req: ModerationDecisionRequest | None = None,
+    current_user: User = Depends(get_current_user),
+):
+    """Человек подтвердил, что сообщение можно доставить (ложное
+    срабатывание эвристики) — снимает с модерации, записывает решение в
+    журнал и ТОЛЬКО теперь вызывает messages_store.store(), делая
+    сообщение видимым получателю."""
+    message, entry = _resolve_hold(hold_id, Decision.APPROVED, req, current_user)
     messages_store.store(message)
-    return ModerationResolveResponse(status="approved", message=_message_to_out(message))
+    return ModerationResolveResponse(
+        status="approved", message=_message_to_out(message), decision_id=entry.decision_id,
+    )
 
 
 @app.post("/moderation/{hold_id}/reject", response_model=ModerationResolveResponse)
-async def moderation_reject(hold_id: str, current_user: User = Depends(get_current_user)):
-    """Человек подтвердил угрозу — снимает с модерации и НЕ вызывает
-    store(): сообщение никогда не становится видимым получателю."""
-    try:
-        pending = moderation_store.get(hold_id)
-    except ModerationError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    _require_moderation_access(pending.message, current_user)
-    message = moderation_store.resolve(hold_id)
-    return ModerationResolveResponse(status="rejected", message=_message_to_out(message))
+async def moderation_reject(
+    hold_id: str,
+    req: ModerationDecisionRequest | None = None,
+    current_user: User = Depends(get_current_user),
+):
+    """Человек подтвердил угрозу — снимает с модерации, записывает решение
+    в журнал и НЕ вызывает store(): сообщение никогда не становится
+    видимым получателю (но решение и его основание остаются в журнале)."""
+    message, entry = _resolve_hold(hold_id, Decision.REJECTED, req, current_user)
+    return ModerationResolveResponse(
+        status="rejected", message=_message_to_out(message), decision_id=entry.decision_id,
+    )
+
+
+@app.get("/moderation/decisions", response_model=ModerationDecisionsListResponse)
+async def moderation_decisions(current_user: User = Depends(get_current_user)):
+    """Журнал решений по удержаниям — только по организациям, где
+    current_user — security_officer (тот же принцип, что
+    /moderation/pending). Новые первыми. Только чтение: решение не
+    редактируется и не удаляется через API."""
+    _require_not_isolated(current_user)
+    visible = [
+        d for d in moderation_decisions_store.list_all()
+        if d.org_id is not None and org_store.is_security_officer(current_user.user_id, d.org_id)
+    ]
+    return ModerationDecisionsListResponse(
+        decisions=[ModerationDecisionOut(**d.to_public_dict()) for d in visible]
+    )
 
 
 @app.get("/moderation/anomaly-summary", response_model=AnomalySummaryResponse)
@@ -910,7 +1007,7 @@ def _require_security_officer(org_id: str, current_user: User) -> None:
     if not org_store.is_security_officer(current_user.user_id, org_id):
         raise HTTPException(
             status_code=403,
-            detail="Только security_officer этой организации может управлять списком доменов",
+            detail="Только security_officer этой организации может это сделать",
         )
 
 
@@ -950,11 +1047,13 @@ async def request_membership(
 async def list_pending_memberships(
     org_id: str, current_user: User = Depends(get_current_user)
 ):
-    """Список заявок на рассмотрении. Доступ не ограничен ролью на уровне
-    самого просмотра (заглушка) — проверка роли встаёт в approve/reject.
-    Изолированному пользователю недоступно вообще (см. _require_not_isolated
-    — данные организации, не персональные)."""
-    _require_not_isolated(current_user)
+    """Список заявок на рассмотрении — только security_officer этой
+    организации (те же права, что у approve/reject). Раньше просмотр был
+    открыт любому залогиненному пользователю — утечка: посторонний видел,
+    кто подаёт заявки в чужую организацию. _require_security_officer сама
+    первым делом вызывает _require_not_isolated, изоляция по-прежнему
+    закрывает доступ."""
+    _require_security_officer(org_id, current_user)
     pending = org_store.list_pending(org_id)
     return MembershipsListResponse(memberships=[_membership_to_out(m) for m in pending])
 
@@ -1175,10 +1274,33 @@ async def my_membership(current_user: User = Depends(get_current_user)):
 
 # --------- WebSocket: потоковый чат для голоса/реального времени ---------
 
-@app.websocket("/ws/chat/{session_id}")
-async def ws_chat(websocket: WebSocket, session_id: str):
+WS_AUTH_TIMEOUT_SECONDS = 10
+
+
+@app.websocket("/ws/chat")
+async def ws_chat(websocket: WebSocket):
+    """Авторизация — ПЕРВЫМ сообщением после подключения:
+        {"token": "<тот же токен, что в Authorization: Bearer>"}
+    Браузерный new WebSocket(url) не умеет передавать заголовки, поэтому
+    Depends(get_current_user) здесь не работает. Токен в URL (?token=)
+    сознательно не используется — он оседает в логах Nginx и истории
+    браузера. Нет валидного токена за WS_AUTH_TIMEOUT_SECONDS -> закрываем
+    с кодом 1008 (policy violation), память не трогаем."""
     await websocket.accept()
-    session = mimir.memory.get(session_id)
+    try:
+        auth_msg = await asyncio.wait_for(
+            websocket.receive_json(), timeout=WS_AUTH_TIMEOUT_SECONDS
+        )
+        token = auth_msg.get("token") if isinstance(auth_msg, dict) else None
+        user = auth_store.user_by_token(token) if isinstance(token, str) else None
+    except (asyncio.TimeoutError, ValueError, WebSocketDisconnect):
+        user = None
+    if user is None:
+        await websocket.close(code=1008)
+        return
+
+    await websocket.send_json({"event": "authenticated"})
+    session = mimir.memory.get(user.user_id)
     try:
         while True:
             user_message = await websocket.receive_text()
@@ -1192,7 +1314,7 @@ async def ws_chat(websocket: WebSocket, session_id: str):
             session.add("assistant", full_reply)
             await websocket.send_json({"event": "done"})
     except WebSocketDisconnect:
-        logger.info("WebSocket отключён: session_id=%s", session_id)
+        logger.info("WebSocket отключён: user_id=%s", user.user_id)
 
 
 if __name__ == "__main__":
