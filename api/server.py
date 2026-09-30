@@ -676,6 +676,35 @@ async def send_message(
         return _send_message_tx(current_user, recipient_ids, text, attachments, device_id)
 
 
+def _threat_decision(classifications: list) -> tuple[bool, list[str]]:
+    """Есть ли среди классификаций угроза и чем её объяснить.
+
+    Решение принимается по ВЕРДИКТУ (level == THREAT), а не по наличию
+    threat_reasons. У classify() два пути к THREAT (core/dlp_heuristics.py):
+    - прямой: сработало самодостаточное THREAT-правило -> причины в
+      threat_reasons;
+    - эскалация: сошлись слабые сигналы (2+ ANOMALY-правила или одно при
+      повышенных правах) -> уровень THREAT, но threat_reasons ПУСТОЙ,
+      причины лежат в anomaly_reasons.
+    Раньше решение принималось по непустому threat_reasons, и THREAT,
+    полученный эскалацией, проходил без удержания/изоляции — и при этом
+    не попадал ни в очередь модерации, ни в ANOMALY-сводку (там только
+    level == anomaly), то есть был не виден человеку вообще.
+
+    Причины для человека берутся из той графы, которая привела к вердикту:
+    threat_reasons, если они есть, иначе anomaly_reasons — чтобы карточка
+    удержания/изоляции не была пустой. Дубли (одинаковые причины от
+    нескольких получателей) убираются, порядок сохраняется.
+    """
+    threat_results = [r for r in classifications if r.level == ThreatLevel.THREAT]
+    reasons = [
+        reason
+        for r in threat_results
+        for reason in (r.threat_reasons or r.anomaly_reasons)
+    ]
+    return bool(threat_results), list(dict.fromkeys(reasons))
+
+
 def _send_message_tx(
     current_user: User,
     recipient_ids: list[str],
@@ -726,13 +755,8 @@ def _send_message_tx(
         # messages отложен до конца транзакции (DEFERRABLE).
         dlp_events_store.add_check(message.message_id, outgoing_check, outgoing_classifications)
 
-        threat_reasons = [
-            reason
-            for result in outgoing_classifications
-            for reason in result.threat_reasons
-            if result.level == ThreatLevel.THREAT
-        ]
-        if threat_reasons:
+        is_threat, threat_reasons = _threat_decision(outgoing_classifications)
+        if is_threat:
             # THREAT на исходящем -> сообщение сохраняется со статусом
             # pending_moderation (невидимо никому) и удерживается до
             # решения officer'а. org_id — снимок организации отправителя
@@ -773,13 +797,8 @@ def _send_message_tx(
         # (fail-open), но получателя изолирует — если он org-linked. Для
         # personal-аккаунтов изоляция не применяется — снять её было бы
         # некому, у personal нет security_officer.
-        threat_reasons = [
-            reason
-            for result in classifications
-            for reason in result.threat_reasons
-            if result.level == ThreatLevel.THREAT
-        ]
-        if threat_reasons and org_store.get_active_membership(check.subject_user_id) is not None:
+        is_threat, threat_reasons = _threat_decision(classifications)
+        if is_threat and org_store.get_active_membership(check.subject_user_id) is not None:
             isolation_store.isolate(check.subject_user_id, threat_reasons)
 
     messages_store.store(message)
