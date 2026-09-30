@@ -11,8 +11,14 @@ mimir_architecture_v2.md §7 ("список наблюдаемых домено�
 по файлообменникам: "узкий и стабильный список, не требующий отдельной
 БД"), эта база — про то, что каждый клиент настраивает сам под себя.
 
-Логика та же, что и в auth_store.py / org_store.py / contacts_store.py /
-dlp_events_store.py: всё в памяти процесса, никакой БД.
+ХРАНЕНИЕ — PostgreSQL, таблицы watchlisted_domains и
+whitelisted_link_domains (migrations/001_initial_schema.sql, раздел 8).
+[РЕШЕНИЕ 11] мягкое удаление: remove_*() не стирает строку, а заполняет
+revoked_at/revoked_by — остаётся след "кто и когда убрал домен" для
+статистики и разбора инцидентов. Все проверки и списки видят только
+действующие записи (revoked_at IS NULL); уникальность (org_id, domain) —
+тоже только среди действующих, так что убранный домен можно добавить
+снова.
 
 Оба списка org-scoped: у организации A нет доступа к списку организации
 B и наоборот — та же изоляция клиентских данных, что и во всех остальных
@@ -57,6 +63,8 @@ import logging
 import secrets
 import time
 from dataclasses import dataclass, field
+
+from core import db
 
 logger = logging.getLogger("mimir.watchlist")
 
@@ -138,13 +146,74 @@ def _normalize_domain(domain: str) -> str:
     return domain.strip().lower()
 
 
+_W_COLS = "entry_id, org_id, domain, reason, added_by, added_at"
+
+
 class WatchlistStore:
     """Домены под наблюдением + белый список ссылок, по организациям —
-    всё в памяти процесса."""
+    PostgreSQL."""
 
-    def __init__(self):
-        self._watchlisted: dict[str, WatchlistedDomain] = {}
-        self._whitelisted: dict[str, WhitelistedLinkDomain] = {}
+    # --------- Общая логика для обеих таблиц ---------
+
+    @staticmethod
+    def _add(table: str, entry_cls, org_id: str, domain: str, added_by: str,
+             reason: str, duplicate_message: str):
+        entry = entry_cls(
+            entry_id=secrets.token_hex(8),
+            org_id=org_id,
+            domain=domain,
+            reason=reason.strip(),
+            added_by=added_by,
+        )
+        try:
+            with db.transaction() as conn:
+                conn.execute(
+                    f"INSERT INTO {table} ({_W_COLS}) VALUES (%s, %s, %s, %s, %s, %s)",
+                    (entry.entry_id, org_id, domain, entry.reason, added_by,
+                     db.to_db_time(entry.added_at)),
+                )
+        except db.UniqueViolation as exc:
+            raise WatchlistError(duplicate_message) from exc
+        return entry
+
+    @staticmethod
+    def _revoke(table: str, org_id: str, entry_id: str, remover_user_id: str) -> str:
+        with db.transaction() as conn:
+            row = conn.execute(
+                f"UPDATE {table} SET revoked_at = now(), revoked_by = %s "
+                "WHERE entry_id = %s AND org_id = %s AND revoked_at IS NULL RETURNING domain",
+                (remover_user_id, entry_id, org_id),
+            ).fetchone()
+        if row is None:
+            raise WatchlistError("Запись не найдена")
+        return row["domain"]
+
+    @staticmethod
+    def _exists(table: str, org_id: str, domain: str) -> bool:
+        with db.transaction() as conn:
+            row = conn.execute(
+                f"SELECT 1 FROM {table} WHERE org_id = %s AND domain = %s "
+                "AND revoked_at IS NULL LIMIT 1",
+                (org_id, domain),
+            ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _list(table: str, entry_cls, org_id: str):
+        with db.transaction() as conn:
+            rows = conn.execute(
+                f"SELECT {_W_COLS} FROM {table} WHERE org_id = %s AND revoked_at IS NULL "
+                "ORDER BY added_at",
+                (org_id,),
+            ).fetchall()
+        return [
+            entry_cls(
+                entry_id=r["entry_id"], org_id=r["org_id"], domain=r["domain"],
+                reason=r["reason"], added_by=r["added_by"],
+                added_at=db.from_db_time(r["added_at"]),
+            )
+            for r in rows
+        ]
 
     # --------- Watchlist (блок 1) ---------
 
@@ -154,49 +223,26 @@ class WatchlistStore:
         domain = _normalize_domain(domain)
         if not domain:
             raise WatchlistError("Домен не может быть пустым")
-        if self._find_watchlisted(org_id, domain) is not None:
-            raise WatchlistError(
-                f"Домен {domain} уже в списке наблюдения этой организации"
-            )
-
-        entry = WatchlistedDomain(
-            entry_id=secrets.token_hex(8),
-            org_id=org_id,
-            domain=domain,
-            reason=reason.strip(),
-            added_by=added_by,
+        entry = self._add(
+            "watchlisted_domains", WatchlistedDomain, org_id, domain, added_by, reason,
+            f"Домен {domain} уже в списке наблюдения этой организации",
         )
-        self._watchlisted[entry.entry_id] = entry
         logger.info(
-            "Домен добавлен в watchlist: %s (org=%s, добавил=%s)",
-            domain, org_id, added_by,
+            "Домен добавлен в watchlist: %s (org=%s, добавил=%s)", domain, org_id, added_by,
         )
         return entry
 
     def remove_watchlisted(self, org_id: str, entry_id: str, remover_user_id: str) -> None:
-        entry = self._watchlisted.get(entry_id)
-        if entry is None or entry.org_id != org_id:
-            raise WatchlistError("Запись не найдена")
-        del self._watchlisted[entry_id]
+        domain = self._revoke("watchlisted_domains", org_id, entry_id, remover_user_id)
         logger.info(
-            "Домен убран из watchlist: %s (org=%s, убрал=%s)",
-            entry.domain, org_id, remover_user_id,
+            "Домен убран из watchlist: %s (org=%s, убрал=%s)", domain, org_id, remover_user_id,
         )
 
     def is_domain_watchlisted(self, org_id: str, domain: str) -> bool:
-        return self._find_watchlisted(org_id, _normalize_domain(domain)) is not None
+        return self._exists("watchlisted_domains", org_id, _normalize_domain(domain))
 
     def list_watchlisted(self, org_id: str) -> list[WatchlistedDomain]:
-        return sorted(
-            (e for e in self._watchlisted.values() if e.org_id == org_id),
-            key=lambda e: e.added_at,
-        )
-
-    def _find_watchlisted(self, org_id: str, domain: str) -> WatchlistedDomain | None:
-        for e in self._watchlisted.values():
-            if e.org_id == org_id and e.domain == domain:
-                return e
-        return None
+        return self._list("watchlisted_domains", WatchlistedDomain, org_id)
 
     # --------- Link whitelist (блок 2) ---------
 
@@ -210,50 +256,33 @@ class WatchlistStore:
             raise WatchlistError(
                 f"Домен {domain} уже разрешён по умолчанию для всех организаций"
             )
-        if self._find_whitelisted(org_id, domain) is not None:
-            raise WatchlistError(
-                f"Домен {domain} уже в белом списке ссылок этой организации"
-            )
-
-        entry = WhitelistedLinkDomain(
-            entry_id=secrets.token_hex(8),
-            org_id=org_id,
-            domain=domain,
-            reason=reason.strip(),
-            added_by=added_by,
+        entry = self._add(
+            "whitelisted_link_domains", WhitelistedLinkDomain, org_id, domain, added_by, reason,
+            f"Домен {domain} уже в белом списке ссылок этой организации",
         )
-        self._whitelisted[entry.entry_id] = entry
         logger.info(
-            "Домен добавлен в whitelist ссылок: %s (org=%s, добавил=%s)",
-            domain, org_id, added_by,
+            "Домен добавлен в whitelist ссылок: %s (org=%s, добавил=%s)", domain, org_id, added_by,
         )
         return entry
 
     def remove_whitelisted_link(self, org_id: str, entry_id: str, remover_user_id: str) -> None:
-        entry = self._whitelisted.get(entry_id)
-        if entry is None or entry.org_id != org_id:
-            raise WatchlistError("Запись не найдена")
-        del self._whitelisted[entry_id]
+        domain = self._revoke("whitelisted_link_domains", org_id, entry_id, remover_user_id)
         logger.info(
             "Домен убран из whitelist ссылок: %s (org=%s, убрал=%s)",
-            entry.domain, org_id, remover_user_id,
+            domain, org_id, remover_user_id,
         )
 
     def is_link_whitelisted(self, org_id: str, domain: str) -> bool:
         domain = _normalize_domain(domain)
         if domain in DEFAULT_WHITELISTED_LINK_DOMAINS:
             return True
-        return self._find_whitelisted(org_id, domain) is not None
+        return self._exists("whitelisted_link_domains", org_id, domain)
 
     def list_whitelisted(self, org_id: str) -> list[WhitelistedLinkDomain]:
-        """Записи, добавленные именно этой организацией — БЕЗ
+        """Действующие записи, добавленные именно этой организацией — БЕЗ
         DEFAULT_WHITELISTED_LINK_DOMAINS (у тех нет entry_id/added_by,
-        это не записи стора). Для отображения общего списка на фронтенде
-        используй list_default_whitelisted()."""
-        return sorted(
-            (e for e in self._whitelisted.values() if e.org_id == org_id),
-            key=lambda e: e.added_at,
-        )
+        это не записи стора). Для общего списка — list_default_whitelisted()."""
+        return self._list("whitelisted_link_domains", WhitelistedLinkDomain, org_id)
 
     @staticmethod
     def list_default_whitelisted() -> list[str]:
@@ -261,9 +290,3 @@ class WatchlistStore:
         может ни убрать из него домен, ни переопределить (см. docstring
         модуля, "проблема холодного старта")."""
         return sorted(DEFAULT_WHITELISTED_LINK_DOMAINS)
-
-    def _find_whitelisted(self, org_id: str, domain: str) -> WhitelistedLinkDomain | None:
-        for e in self._whitelisted.values():
-            if e.org_id == org_id and e.domain == domain:
-                return e
-        return None

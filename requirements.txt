@@ -7,6 +7,10 @@ PyYAML==6.0.2
 email-validator==2.2.0
 python-multipart==0.0.9  # нужен FastAPI для Form/File в /messages/send (multipart/form-data)
 
+# База данных (PostgreSQL, синхронный драйвер — mimir_architecture_v2.md §9.7)
+psycopg[binary]==3.2.3
+psycopg-pool==3.2.4
+
 # Claude
 anthropic==0.34.2
 

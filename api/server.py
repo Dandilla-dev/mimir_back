@@ -10,16 +10,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 
+from core import db
 from core.mimir import Mimir
 from core.config import get_settings
 from core.auth_store import AuthError, AuthStore, User
 from core.contacts_store import Contact, ContactsError, ContactsStore
-from core.messages_store import Message, MessagesError, MessagesStore
+from core.messages_store import Message, MessagesError, MessageStatus, MessagesStore
 from core.org_store import Membership, Organization, OrgError, OrgStore
 from core.message_bridge import check_incoming, check_outgoing
 from core.dlp_events_store import DLPEventsStore
@@ -37,7 +40,36 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mimir.api")
 
 settings = get_settings()
-app = FastAPI(title="Mimir API", version="0.1.0")
+
+# [РЕШЕНИЕ 10] Как часто фоновая задача стирает содержимое отклонённых
+# сообщений (сам срок хранения — сутки — в messages_store).
+PURGE_INTERVAL_SECONDS = int(os.getenv("PURGE_INTERVAL_SECONDS", "3600"))
+
+
+async def _purge_rejected_loop() -> None:
+    """Раз в PURGE_INTERVAL_SECONDS стирает текст и вложения сообщений,
+    отклонённых модерацией больше суток назад. Синхронный запрос к БД
+    выполняется в отдельном потоке, чтобы не блокировать event loop.
+    Сбой одной итерации логируется и не останавливает цикл."""
+    while True:
+        try:
+            await asyncio.to_thread(messages_store.purge_rejected_content)
+        except Exception:
+            logger.exception("Фоновое стирание отклонённых сообщений не удалось")
+        await asyncio.sleep(PURGE_INTERVAL_SECONDS)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    purge_task = asyncio.create_task(_purge_rejected_loop())
+    try:
+        yield
+    finally:
+        purge_task.cancel()
+        db.close_pool()
+
+
+app = FastAPI(title="Mimir API", version="0.1.0", lifespan=lifespan)
 
 # CORS: разрешаем доступ SDK из браузерных приложений.
 app.add_middleware(
@@ -53,7 +85,7 @@ contacts_store = ContactsStore(auth_store)
 messages_store = MessagesStore()
 org_store = OrgStore()
 dlp_events_store = DLPEventsStore()
-moderation_store = ModerationStore()
+moderation_store = ModerationStore(messages_store)
 moderation_decisions_store = ModerationDecisionsStore()
 isolation_store = IsolationStore()
 watchlist_store = WatchlistStore()
@@ -561,14 +593,38 @@ def _require_officer_for_user(target_user_id: str, current_user: User) -> None:
         )
 
 
-def _require_moderation_access(message: Message, current_user: User) -> None:
-    """Право модерировать hold принадлежит security_officer ОРГАНИЗАЦИИ
-    ОТПРАВИТЕЛЯ (см. комментарий над /moderation/* выше). membership is
-    None здесь для сегодняшнего кода недостижимо — hold без организации
-    у отправителя не создаётся (check_outgoing() отсекает personal-
-    аккаунты раньше любой классификации) — проверка оставлена как
-    защита от будущего рефакторинга, а не обработка реального случая."""
-    _require_officer_for_user(message.sender_id, current_user)
+def _require_moderation_access(org_id: str, current_user: User) -> None:
+    """Право модерировать hold принадлежит НЕ изолированному
+    security_officer организации из hold.org_id — снимка организации
+    отправителя на момент поступления сообщения ([РЕШЕНИЕ 7],
+    mimir_db_migration_contract.md), а не его текущего членства: если
+    отправителя исключили или перевели, пока сообщение ждёт решения,
+    разбирает всё равно officer той организации."""
+    if isolation_store.is_isolated(current_user.user_id):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Аккаунт изолирован — officer-права недоступны, пока другой "
+                "security_officer этой организации не снимет изоляцию"
+            ),
+        )
+    if not org_store.is_security_officer(current_user.user_id, org_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Только security_officer организации отправителя может это сделать",
+        )
+
+
+def _officer_org_ids(current_user: User) -> list[str]:
+    """Организации, где current_user — security_officer. Сейчас у
+    пользователя не больше одного активного членства (инвариант БД
+    memberships_one_active_per_user), поэтому список из 0 или 1 элемента."""
+    membership = org_store.get_active_membership(current_user.user_id)
+    if membership is None or not org_store.is_security_officer(
+        current_user.user_id, membership.org_id
+    ):
+        return []
+    return [membership.org_id]
 
 
 @app.post("/messages/send", response_model=MessageOut | MessagePendingModerationOut)
@@ -611,6 +667,23 @@ async def send_message(
                 ),
             )
 
+    # Всё, что ниже пишет в БД — сообщение, DLP-события, удержание,
+    # изоляция получателя — одна транзакция: либо записано всё, либо
+    # ничего (раньше падение процесса посередине оставляло, например,
+    # DLP-события без сообщения). HTTPException внутри блока откатывает
+    # транзакцию.
+    with db.transaction():
+        return _send_message_tx(current_user, recipient_ids, text, attachments, device_id)
+
+
+def _send_message_tx(
+    current_user: User,
+    recipient_ids: list[str],
+    text: str,
+    attachments: list[dict],
+    device_id: str | None,
+) -> MessageOut | MessagePendingModerationOut:
+    """Тело /messages/send внутри транзакции (см. send_message выше)."""
     try:
         message = messages_store.build_message(
             sender_id=current_user.user_id,
@@ -623,14 +696,12 @@ async def send_message(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     # (check, classifications) пары — classify() вызывается здесь, снаружи
-    # dlp_events_store.py (см. обсуждение в чате, пункт 1.1 — стор ничего
-    # не решает и не вычисляет сам).
+    # dlp_events_store.py (стор ничего не решает и не вычисляет сам).
     dlp_checks: list[tuple] = []
 
     # Исходящая — fail-closed на СБОЕ проверки (ядро продукта, утечка от
     # сотрудника): если проверка не отработала, сообщение НЕ сохраняется и
-    # не доставляется вообще никому (нет бытового эквивалента "я и так
-    # терплю этот риск" для утечки). check_outgoing() сама возвращает None
+    # не доставляется вообще никому. check_outgoing() сама возвращает None
     # для личных/standalone аккаунтов — для них этот блок не бросает и не
     # блокирует.
     try:
@@ -651,7 +722,8 @@ async def send_message(
         outgoing_classifications = [classify(event) for event in outgoing_check.events]
         # Событие/классификацию сохраняем В ЛЮБОМ СЛУЧАЕ, даже если ниже
         # сообщение уйдёт на модерацию — это данные для будущего датасета
-        # (неделя 7), не зависят от того, доставлено сообщение или нет.
+        # (неделя 7). Сообщения в БД ещё нет — FOREIGN KEY событий на
+        # messages отложен до конца транзакции (DEFERRABLE).
         dlp_events_store.add_check(message.message_id, outgoing_check, outgoing_classifications)
 
         threat_reasons = [
@@ -661,24 +733,32 @@ async def send_message(
             if result.level == ThreatLevel.THREAT
         ]
         if threat_reasons:
-            # THREAT на исходящем -> не store(), удерживаем на модерации
-            # (см. комментарий над эндпоинтом). message уже построен
-            # (build_message), но ещё не сохранён — значит его до сих пор
-            # никто не видит ни в inbox(), ни в history().
-            pending = moderation_store.hold(message, threat_reasons)
+            # THREAT на исходящем -> сообщение сохраняется со статусом
+            # pending_moderation (невидимо никому) и удерживается до
+            # решения officer'а. org_id — снимок организации отправителя
+            # на этот момент ([РЕШЕНИЕ 7]); check_outgoing() не вернул бы
+            # проверку без активного членства, поэтому оно здесь есть.
+            sender_membership = org_store.get_active_membership(message.sender_id)
+            if sender_membership is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Проверка сообщения временно недоступна, попробуйте ещё раз",
+                )
+            messages_store.store(message, status=MessageStatus.PENDING_MODERATION)
+            pending = moderation_store.hold(message, threat_reasons, sender_membership.org_id)
             return MessagePendingModerationOut(
                 hold_id=pending.hold_id, threat_reasons=threat_reasons,
             )
 
-    # Входящая — fail-open на СБОЕ проверки. Защита получателя от фишинга
-    # сверх базового уровня: если проверка не отработала, сообщение всё
-    # равно доставляется как обычно — откат к риску обычного
-    # непроверяемого мессенджера, а не новая уязвимость. THREAT-результат
-    # входящей проверки здесь пока НЕ блокирует доставку (см. TODO выше).
+    # Входящая — fail-open на СБОЕ проверки: если проверка не отработала,
+    # сообщение всё равно доставляется как обычно. Вложенная транзакция
+    # (SAVEPOINT): ошибка БД внутри проверки откатывает только её, а не
+    # всю отправку — иначе транзакция осталась бы в сломанном состоянии.
     try:
-        incoming_checks = check_incoming(
-            message, auth_store, org_store, contacts_store, watchlist_store, access_store
-        )
+        with db.transaction():
+            incoming_checks = check_incoming(
+                message, auth_store, org_store, contacts_store, watchlist_store, access_store
+            )
     except Exception:
         incoming_checks = []
         logger.exception(
@@ -689,12 +769,10 @@ async def send_message(
         classifications = [classify(event) for event in check.events]
         dlp_checks.append((check, classifications))
 
-        # Автоизоляция получателя (core/isolation_store.py, открытый
-        # вопрос 1): входящий THREAT сообщение НЕ блокирует (fail-open,
-        # как и раньше), но получателя изолирует — если он org-linked.
-        # Для personal-аккаунтов изоляция НЕ применяется вообще (см.
-        # обсуждение в чате) — снять её было бы некому, у personal нет
-        # security_officer.
+        # Автоизоляция получателя: входящий THREAT сообщение НЕ блокирует
+        # (fail-open), но получателя изолирует — если он org-linked. Для
+        # personal-аккаунтов изоляция не применяется — снять её было бы
+        # некому, у personal нет security_officer.
         threat_reasons = [
             reason
             for result in classifications
@@ -722,11 +800,9 @@ async def moderation_pending(current_user: User = Depends(get_current_user)):
     # Видна только очередь ТЕХ организаций, где current_user —
     # security_officer (см. _require_moderation_access) — не глобальная
     # очередь всей системы вне зависимости от того, кто спрашивает.
-    pending = [
-        p for p in moderation_store.list_pending()
-        if (m := org_store.get_active_membership(p.message.sender_id)) is not None
-        and org_store.is_security_officer(current_user.user_id, m.org_id)
-    ]
+    # Фильтр — по hold.org_id (снимок, [РЕШЕНИЕ 7]), не по текущему
+    # членству отправителя.
+    pending = moderation_store.list_pending(org_ids=_officer_org_ids(current_user))
     return ModerationQueueResponse(
         pending=[
             PendingModerationOut(
@@ -746,37 +822,44 @@ def _resolve_hold(
     req: ModerationDecisionRequest | None,
     current_user: User,
 ) -> tuple[Message, ModerationDecision]:
-    """Общая часть approve/reject: проверка прав -> снятие из очереди ->
-    запись решения в журнал (core/moderation_decisions_store.py).
+    """Общая часть approve/reject — одна транзакция: проверка прав ->
+    закрытие удержания -> смена статуса сообщения -> запись решения в
+    журнал (core/moderation_decisions_store.py). Упало любое звено —
+    откатывается всё, удержание остаётся открытым.
 
-    Порядок важен: resolve() раньше record() — resolve() атомарно
-    убирает hold из очереди (dict.pop), поэтому второй officer, нажавший
-    одновременно, получит 404 на resolve() и НЕ запишет второе решение.
-    org_id берётся снимком на момент решения — членство отправителя
-    потом может измениться, решение должно остаться привязанным к той
-    организации, чей officer его принял."""
-    try:
-        pending = moderation_store.get(hold_id)  # без снятия из очереди — сперва право, потом resolve
-    except ModerationError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    _require_moderation_access(pending.message, current_user)
-    try:
-        message = moderation_store.resolve(hold_id)
-    except ModerationError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    resolve() — UPDATE ... WHERE resolved_at IS NULL: второй officer,
+    нажавший одновременно, дождётся блокировки строки, получит 0 строк
+    -> 404 и второе решение не запишет.
 
-    membership = org_store.get_active_membership(message.sender_id)
-    entry = moderation_decisions_store.record(
-        hold_id=pending.hold_id,
-        message_id=message.message_id,
-        sender_id=message.sender_id,
-        org_id=membership.org_id if membership else None,
-        decided_by=current_user.user_id,
-        decision=decision,
-        reviewer_confidence=req.reviewer_confidence if req else None,
-        threat_reasons=pending.threat_reasons,
-        held_at=pending.held_at,
-    )
+    org_id решения — из удержания (снимок, [РЕШЕНИЕ 7]), не из текущего
+    членства отправителя, поэтому всегда заполнен."""
+    with db.transaction():
+        try:
+            pending = moderation_store.get(hold_id)  # сперва право, потом resolve
+        except ModerationError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        _require_moderation_access(pending.org_id, current_user)
+        try:
+            message = moderation_store.resolve(hold_id)
+        except ModerationError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+        if decision == Decision.APPROVED:
+            messages_store.mark_delivered(message.message_id)  # теперь видно получателю
+        else:
+            messages_store.mark_rejected(message.message_id)   # невидимо; стирание через сутки
+
+        entry = moderation_decisions_store.record(
+            hold_id=pending.hold_id,
+            message_id=message.message_id,
+            sender_id=message.sender_id,
+            org_id=pending.org_id,
+            decided_by=current_user.user_id,
+            decision=decision,
+            reviewer_confidence=req.reviewer_confidence if req else None,
+            threat_reasons=pending.threat_reasons,
+            held_at=pending.held_at,
+        )
     return message, entry
 
 
@@ -787,11 +870,9 @@ async def moderation_approve(
     current_user: User = Depends(get_current_user),
 ):
     """Человек подтвердил, что сообщение можно доставить (ложное
-    срабатывание эвристики) — снимает с модерации, записывает решение в
-    журнал и ТОЛЬКО теперь вызывает messages_store.store(), делая
-    сообщение видимым получателю."""
+    срабатывание эвристики) — удержание закрывается, решение пишется в
+    журнал, статус сообщения становится delivered — оно видно получателю."""
     message, entry = _resolve_hold(hold_id, Decision.APPROVED, req, current_user)
-    messages_store.store(message)
     return ModerationResolveResponse(
         status="approved", message=_message_to_out(message), decision_id=entry.decision_id,
     )
@@ -803,9 +884,10 @@ async def moderation_reject(
     req: ModerationDecisionRequest | None = None,
     current_user: User = Depends(get_current_user),
 ):
-    """Человек подтвердил угрозу — снимает с модерации, записывает решение
-    в журнал и НЕ вызывает store(): сообщение никогда не становится
-    видимым получателю (но решение и его основание остаются в журнале)."""
+    """Человек подтвердил угрозу — удержание закрывается, решение пишется
+    в журнал, статус сообщения становится rejected: получатель его не
+    увидит никогда, содержимое стирается через сутки ([РЕШЕНИЕ 10]),
+    метаданные и решение остаются."""
     message, entry = _resolve_hold(hold_id, Decision.REJECTED, req, current_user)
     return ModerationResolveResponse(
         status="rejected", message=_message_to_out(message), decision_id=entry.decision_id,
@@ -819,10 +901,7 @@ async def moderation_decisions(current_user: User = Depends(get_current_user)):
     /moderation/pending). Новые первыми. Только чтение: решение не
     редактируется и не удаляется через API."""
     _require_not_isolated(current_user)
-    visible = [
-        d for d in moderation_decisions_store.list_all()
-        if d.org_id is not None and org_store.is_security_officer(current_user.user_id, d.org_id)
-    ]
+    visible = moderation_decisions_store.list_all(org_ids=_officer_org_ids(current_user))
     return ModerationDecisionsListResponse(
         decisions=[ModerationDecisionOut(**d.to_public_dict()) for d in visible]
     )

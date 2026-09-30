@@ -14,6 +14,19 @@ cp .env.example .env
 # затем впишите ANTHROPIC_API_KEY в .env
 ```
 
+## База данных
+
+Все данные сервера хранятся в PostgreSQL 16 (схема — `migrations/`,
+решения — `mimir_db_migration_contract.md`).
+
+```bash
+docker compose up -d db        # локальный PostgreSQL (mimir/mimir/mimir)
+python -m core.migrate         # применить новые миграции (повторный запуск безопасен)
+```
+
+Правило: применённый файл `migrations/NNN_*.sql` не редактируется —
+изменения схемы только новым файлом со следующим номером.
+
 ## Запуск
 
 ```bash

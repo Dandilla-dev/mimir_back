@@ -9,8 +9,14 @@ mimir_architecture_v2.md §7 ("реестр устройств + роли дос
 (в отличие от watchlist доменов, вынесенного в core/watchlist_store.py
 отдельным долгом).
 
-Логика та же, что и в auth_store.py / org_store.py / watchlist_store.py:
-всё в памяти процесса, org-scoped, никакой БД.
+ХРАНЕНИЕ — PostgreSQL, таблицы registered_devices и access_grants
+(migrations/001_initial_schema.sql, раздел 9). Решения контракта:
+- [РЕШЕНИЕ 9] оба вида грантов — одна таблица access_grants с колонкой
+  grant_type ('legitimate_access' | 'elevated_rights'); публичные методы
+  остались раздельными, как раньше;
+- [РЕШЕНИЕ 11] мягкое удаление: unregister/revoke заполняют
+  revoked_at/revoked_by вместо удаления строки; проверки и списки видят
+  только действующие записи, уникальность — тоже только среди них.
 
 --- Устройства (блок 5) ---
 
@@ -46,6 +52,8 @@ import logging
 import secrets
 import time
 from dataclasses import dataclass, field
+
+from core import db
 
 logger = logging.getLogger("mimir.access")
 
@@ -101,14 +109,32 @@ class AccessGrant:
         }
 
 
+_D_COLS = "entry_id, org_id, device_id, user_id, label, registered_by, registered_at"
+_G_COLS = "entry_id, org_id, user_id, granted_by, note, granted_at"
+
+LEGITIMATE_ACCESS = "legitimate_access"
+ELEVATED_RIGHTS = "elevated_rights"
+
+
+def _row_to_device(r: dict) -> RegisteredDevice:
+    return RegisteredDevice(
+        entry_id=r["entry_id"], org_id=r["org_id"], device_id=r["device_id"],
+        user_id=r["user_id"], label=r["label"], registered_by=r["registered_by"],
+        registered_at=db.from_db_time(r["registered_at"]),
+    )
+
+
+def _row_to_grant(r: dict) -> AccessGrant:
+    return AccessGrant(
+        entry_id=r["entry_id"], org_id=r["org_id"], user_id=r["user_id"],
+        granted_by=r["granted_by"], note=r["note"],
+        granted_at=db.from_db_time(r["granted_at"]),
+    )
+
+
 class AccessStore:
     """Устройства + легитимный доступ + повышенные права — по
-    организациям, всё в памяти процесса."""
-
-    def __init__(self):
-        self._devices: dict[str, RegisteredDevice] = {}
-        self._legitimate_access: dict[str, AccessGrant] = {}
-        self._elevated_rights: dict[str, AccessGrant] = {}
+    организациям, PostgreSQL."""
 
     # --------- Устройства (блок 5) ---------
 
@@ -118,8 +144,6 @@ class AccessStore:
         device_id = device_id.strip()
         if not device_id:
             raise AccessError("device_id не может быть пустым")
-        if self._find_device(org_id, device_id) is not None:
-            raise AccessError(f"Устройство {device_id} уже зарегистрировано в этой организации")
 
         entry = RegisteredDevice(
             entry_id=secrets.token_hex(8),
@@ -129,7 +153,17 @@ class AccessStore:
             label=label.strip(),
             registered_by=registered_by,
         )
-        self._devices[entry.entry_id] = entry
+        try:
+            with db.transaction() as conn:
+                conn.execute(
+                    f"INSERT INTO registered_devices ({_D_COLS}) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (entry.entry_id, org_id, device_id, user_id, entry.label, registered_by,
+                     db.to_db_time(entry.registered_at)),
+                )
+        except db.UniqueViolation as exc:
+            raise AccessError(f"Устройство {device_id} уже зарегистрировано в этой организации") from exc
+        except db.ForeignKeyViolation as exc:
+            raise AccessError("Пользователь не найден") from exc
         logger.info(
             "Устройство зарегистрировано: %s (org=%s, владелец=%s, зарегистрировал=%s)",
             device_id, org_id, user_id, registered_by,
@@ -137,42 +171,102 @@ class AccessStore:
         return entry
 
     def unregister_device(self, org_id: str, entry_id: str, remover_user_id: str) -> None:
-        entry = self._devices.get(entry_id)
-        if entry is None or entry.org_id != org_id:
+        with db.transaction() as conn:
+            row = conn.execute(
+                "UPDATE registered_devices SET revoked_at = now(), revoked_by = %s "
+                "WHERE entry_id = %s AND org_id = %s AND revoked_at IS NULL RETURNING device_id",
+                (remover_user_id, entry_id, org_id),
+            ).fetchone()
+        if row is None:
             raise AccessError("Устройство не найдено")
-        del self._devices[entry_id]
         logger.info(
             "Устройство снято с учёта: %s (org=%s, снял=%s)",
-            entry.device_id, org_id, remover_user_id,
+            row["device_id"], org_id, remover_user_id,
         )
 
     def is_device_registered(self, org_id: str, device_id: str) -> bool:
-        return self._find_device(org_id, device_id.strip()) is not None
+        with db.transaction() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM registered_devices WHERE org_id = %s AND device_id = %s "
+                "AND revoked_at IS NULL LIMIT 1",
+                (org_id, device_id.strip()),
+            ).fetchone()
+        return row is not None
 
     def list_devices(self, org_id: str) -> list[RegisteredDevice]:
-        return sorted(
-            (d for d in self._devices.values() if d.org_id == org_id),
-            key=lambda d: d.registered_at,
-        )
+        with db.transaction() as conn:
+            rows = conn.execute(
+                f"SELECT {_D_COLS} FROM registered_devices WHERE org_id = %s "
+                "AND revoked_at IS NULL ORDER BY registered_at",
+                (org_id,),
+            ).fetchall()
+        return [_row_to_device(r) for r in rows]
 
-    def _find_device(self, org_id: str, device_id: str) -> RegisteredDevice | None:
-        for d in self._devices.values():
-            if d.org_id == org_id and d.device_id == device_id:
-                return d
-        return None
+    # --------- Гранты (блок 6): общая логика для двух типов ---------
+
+    @staticmethod
+    def _grant(grant_type: str, org_id: str, user_id: str, granted_by: str,
+               note: str, duplicate_message: str) -> AccessGrant:
+        grant = AccessGrant(
+            entry_id=secrets.token_hex(8), org_id=org_id, user_id=user_id,
+            granted_by=granted_by, note=note.strip(),
+        )
+        try:
+            with db.transaction() as conn:
+                conn.execute(
+                    "INSERT INTO access_grants (entry_id, org_id, user_id, grant_type, "
+                    "granted_by, note, granted_at) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (grant.entry_id, org_id, user_id, grant_type, granted_by, grant.note,
+                     db.to_db_time(grant.granted_at)),
+                )
+        except db.UniqueViolation as exc:
+            raise AccessError(duplicate_message) from exc
+        except db.ForeignKeyViolation as exc:
+            raise AccessError("Пользователь не найден") from exc
+        return grant
+
+    @staticmethod
+    def _revoke(grant_type: str, org_id: str, entry_id: str, revoked_by: str) -> str:
+        with db.transaction() as conn:
+            row = conn.execute(
+                "UPDATE access_grants SET revoked_at = now(), revoked_by = %s "
+                "WHERE entry_id = %s AND org_id = %s AND grant_type = %s "
+                "AND revoked_at IS NULL RETURNING user_id",
+                (revoked_by, entry_id, org_id, grant_type),
+            ).fetchone()
+        if row is None:
+            raise AccessError("Грант не найден")
+        return row["user_id"]
+
+    @staticmethod
+    def _has(grant_type: str, org_id: str, user_id: str) -> bool:
+        with db.transaction() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM access_grants WHERE org_id = %s AND user_id = %s "
+                "AND grant_type = %s AND revoked_at IS NULL LIMIT 1",
+                (org_id, user_id, grant_type),
+            ).fetchone()
+        return row is not None
+
+    @staticmethod
+    def _list(grant_type: str, org_id: str) -> list[AccessGrant]:
+        with db.transaction() as conn:
+            rows = conn.execute(
+                f"SELECT {_G_COLS} FROM access_grants WHERE org_id = %s AND grant_type = %s "
+                "AND revoked_at IS NULL ORDER BY granted_at",
+                (org_id, grant_type),
+            ).fetchall()
+        return [_row_to_grant(r) for r in rows]
 
     # --------- Легитимный доступ (блок 6) ---------
 
     def grant_legitimate_access(
         self, org_id: str, user_id: str, granted_by: str, note: str = "",
     ) -> AccessGrant:
-        if self._find_grant(self._legitimate_access, org_id, user_id) is not None:
-            raise AccessError("У пользователя уже есть согласованный доступ в этой организации")
-        grant = AccessGrant(
-            entry_id=secrets.token_hex(8), org_id=org_id, user_id=user_id,
-            granted_by=granted_by, note=note.strip(),
+        grant = self._grant(
+            LEGITIMATE_ACCESS, org_id, user_id, granted_by, note,
+            "У пользователя уже есть согласованный доступ в этой организации",
         )
-        self._legitimate_access[grant.entry_id] = grant
         logger.info(
             "Легитимный доступ согласован: user=%s (org=%s, согласовал=%s)",
             user_id, org_id, granted_by,
@@ -180,64 +274,39 @@ class AccessStore:
         return grant
 
     def revoke_legitimate_access(self, org_id: str, entry_id: str, revoked_by: str) -> None:
-        grant = self._legitimate_access.get(entry_id)
-        if grant is None or grant.org_id != org_id:
-            raise AccessError("Грант не найден")
-        del self._legitimate_access[entry_id]
+        user_id = self._revoke(LEGITIMATE_ACCESS, org_id, entry_id, revoked_by)
         logger.info(
-            "Легитимный доступ отозван: user=%s (org=%s, отозвал=%s)",
-            grant.user_id, org_id, revoked_by,
+            "Легитимный доступ отозван: user=%s (org=%s, отозвал=%s)", user_id, org_id, revoked_by,
         )
 
     def has_legitimate_access(self, org_id: str, user_id: str) -> bool:
-        return self._find_grant(self._legitimate_access, org_id, user_id) is not None
+        return self._has(LEGITIMATE_ACCESS, org_id, user_id)
 
     def list_legitimate_access(self, org_id: str) -> list[AccessGrant]:
-        return sorted(
-            (g for g in self._legitimate_access.values() if g.org_id == org_id),
-            key=lambda g: g.granted_at,
-        )
+        return self._list(LEGITIMATE_ACCESS, org_id)
 
     # --------- Повышенные права (блок 6) ---------
 
     def grant_elevated_rights(
         self, org_id: str, user_id: str, granted_by: str, note: str = "",
     ) -> AccessGrant:
-        if self._find_grant(self._elevated_rights, org_id, user_id) is not None:
-            raise AccessError("У пользователя уже есть повышенные права в этой организации")
-        grant = AccessGrant(
-            entry_id=secrets.token_hex(8), org_id=org_id, user_id=user_id,
-            granted_by=granted_by, note=note.strip(),
+        grant = self._grant(
+            ELEVATED_RIGHTS, org_id, user_id, granted_by, note,
+            "У пользователя уже есть повышенные права в этой организации",
         )
-        self._elevated_rights[grant.entry_id] = grant
         logger.info(
-            "Повышенные права выданы: user=%s (org=%s, выдал=%s)",
-            user_id, org_id, granted_by,
+            "Повышенные права выданы: user=%s (org=%s, выдал=%s)", user_id, org_id, granted_by,
         )
         return grant
 
     def revoke_elevated_rights(self, org_id: str, entry_id: str, revoked_by: str) -> None:
-        grant = self._elevated_rights.get(entry_id)
-        if grant is None or grant.org_id != org_id:
-            raise AccessError("Грант не найден")
-        del self._elevated_rights[entry_id]
+        user_id = self._revoke(ELEVATED_RIGHTS, org_id, entry_id, revoked_by)
         logger.info(
-            "Повышенные права отозваны: user=%s (org=%s, отозвал=%s)",
-            grant.user_id, org_id, revoked_by,
+            "Повышенные права отозваны: user=%s (org=%s, отозвал=%s)", user_id, org_id, revoked_by,
         )
 
     def has_elevated_rights(self, org_id: str, user_id: str) -> bool:
-        return self._find_grant(self._elevated_rights, org_id, user_id) is not None
+        return self._has(ELEVATED_RIGHTS, org_id, user_id)
 
     def list_elevated_rights(self, org_id: str) -> list[AccessGrant]:
-        return sorted(
-            (g for g in self._elevated_rights.values() if g.org_id == org_id),
-            key=lambda g: g.granted_at,
-        )
-
-    @staticmethod
-    def _find_grant(grants: dict[str, AccessGrant], org_id: str, user_id: str) -> AccessGrant | None:
-        for g in grants.values():
-            if g.org_id == org_id and g.user_id == user_id:
-                return g
-        return None
+        return self._list(ELEVATED_RIGHTS, org_id)

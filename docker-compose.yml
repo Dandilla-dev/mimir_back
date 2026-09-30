@@ -1,0 +1,22 @@
+# Локальный PostgreSQL для разработки Mimir.
+#   docker compose up -d db      — запустить
+#   docker compose down          — остановить (данные остаются в томе)
+#   docker compose down -v       — остановить и УДАЛИТЬ данные
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: mimir
+      POSTGRES_PASSWORD: mimir
+      POSTGRES_DB: mimir
+    ports:
+      - "127.0.0.1:5432:5432"   # только локально, не наружу
+    volumes:
+      - mimir_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mimir"]
+      interval: 5s
+      retries: 10
+
+volumes:
+  mimir_pgdata:

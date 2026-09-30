@@ -38,14 +38,22 @@ org_store.py). Не знает про core/message_parser.py, core/messages_stor
 message_parser.py (is_audio_attachment/contains_link), а применяет её
 api/server.py при гейтинге /messages/send.
 
-Как и остальные *_store.py в проекте — всё в памяти процесса, без БД.
+ХРАНЕНИЕ — PostgreSQL, таблица isolation_records
+(migrations/001_initial_schema.sql, раздел 6). [РЕШЕНИЕ 8]: история
+изоляций хранится — isolation_id первичный ключ, user_id обычное поле.
+Раньше повторная изоляция после снятия затирала прошлую запись; теперь
+создаётся новая строка, старая остаётся. "Не больше одной активной
+изоляции на пользователя" держит частичный UNIQUE-индекс в БД.
 """
 
 from __future__ import annotations
 
 import logging
 import time
+import secrets
 from dataclasses import dataclass, field
+
+from core import db
 
 logger = logging.getLogger("mimir.isolation")
 
@@ -56,14 +64,15 @@ class IsolationError(Exception):
 
 @dataclass
 class IsolationRecord:
-    """Состояние изоляции одного пользователя. Одна запись на user_id —
-    не история holds, а текущее состояние (активна/снята)."""
+    """Одна изоляция одного пользователя (у пользователя может быть
+    несколько записей — история; активной — не больше одной)."""
 
     user_id: str
     threat_reasons: list[str] = field(default_factory=list)
     isolated_at: float = field(default_factory=time.time)
     lifted_at: float | None = None
     lifted_by: str | None = None
+    isolation_id: str = field(default_factory=lambda: secrets.token_hex(8))
 
     @property
     def is_active(self) -> bool:
@@ -80,51 +89,105 @@ class IsolationRecord:
         }
 
 
-class IsolationStore:
-    """Состояние изоляции по пользователю — всё в памяти процесса."""
+_I_COLS = "isolation_id, user_id, threat_reasons, isolated_at, lifted_at, lifted_by"
 
-    def __init__(self):
-        self._records: dict[str, IsolationRecord] = {}
+
+def _row_to_record(row: dict) -> IsolationRecord:
+    return IsolationRecord(
+        user_id=row["user_id"],
+        threat_reasons=list(row["threat_reasons"]),
+        isolated_at=db.from_db_time(row["isolated_at"]),
+        lifted_at=db.from_db_time(row["lifted_at"]),
+        lifted_by=row["lifted_by"],
+        isolation_id=row["isolation_id"],
+    )
+
+
+class IsolationStore:
+    """Изоляции пользователей с историей — PostgreSQL."""
 
     def isolate(self, user_id: str, threat_reasons: list[str]) -> IsolationRecord:
         """Накладывает изоляцию. Если пользователь уже активно изолирован —
         НЕ создаёт вторую запись и не сбрасывает isolated_at: повторный
         THREAT во время уже действующей изоляции — это дополнительное
         подтверждение риска, а не повод начинать отсчёт заново. Новые
-        причины добавляются к уже накопленным (без дублей)."""
-        existing = self._records.get(user_id)
-        if existing is not None and existing.is_active:
-            for reason in threat_reasons:
-                if reason not in existing.threat_reasons:
-                    existing.threat_reasons.append(reason)
-            return existing
+        причины добавляются к уже накопленным (без дублей, порядок
+        первого появления сохраняется).
 
-        record = IsolationRecord(user_id=user_id, threat_reasons=list(threat_reasons))
-        self._records[user_id] = record
-        logger.info("Аккаунт %s изолирован: reasons=%s", user_id, threat_reasons)
-        return record
+        Одним запросом (INSERT ... ON CONFLICT по частичному индексу
+        активной изоляции) — две одновременные изоляции одного
+        пользователя не создадут две активные записи."""
+        with db.transaction() as conn:
+            row = conn.execute(
+                f"""
+                INSERT INTO isolation_records (isolation_id, user_id, threat_reasons)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (user_id) WHERE lifted_at IS NULL DO UPDATE SET
+                    threat_reasons = (
+                        SELECT COALESCE(jsonb_agg(reason ORDER BY first_pos), '[]'::jsonb)
+                        FROM (
+                            SELECT reason, MIN(pos) AS first_pos
+                            FROM jsonb_array_elements_text(
+                                     isolation_records.threat_reasons || EXCLUDED.threat_reasons
+                                 ) WITH ORDINALITY AS t(reason, pos)
+                            GROUP BY reason
+                        ) dedup
+                    )
+                RETURNING {_I_COLS}, (xmax = 0) AS inserted
+                """,
+                (secrets.token_hex(8), user_id, db.jsonb(threat_reasons)),
+            ).fetchone()
+        if row["inserted"]:
+            logger.info("Аккаунт %s изолирован: reasons=%s", user_id, threat_reasons)
+        return _row_to_record(row)
 
     def is_isolated(self, user_id: str) -> bool:
-        record = self._records.get(user_id)
-        return record is not None and record.is_active
+        with db.transaction() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM isolation_records WHERE user_id = %s AND lifted_at IS NULL",
+                (user_id,),
+            ).fetchone()
+        return row is not None
 
     def get(self, user_id: str) -> IsolationRecord | None:
-        return self._records.get(user_id)
+        """Текущая изоляция пользователя: активная, а если активной нет —
+        последняя снятая (как раньше: одна запись на пользователя)."""
+        with db.transaction() as conn:
+            row = conn.execute(
+                f"SELECT {_I_COLS} FROM isolation_records WHERE user_id = %s "
+                "ORDER BY (lifted_at IS NULL) DESC, isolated_at DESC LIMIT 1",
+                (user_id,),
+            ).fetchone()
+        return _row_to_record(row) if row else None
+
+    def history(self, user_id: str) -> list[IsolationRecord]:
+        """Все изоляции пользователя, старые первыми — для аудита и
+        статистики ([РЕШЕНИЕ 8])."""
+        with db.transaction() as conn:
+            rows = conn.execute(
+                f"SELECT {_I_COLS} FROM isolation_records WHERE user_id = %s ORDER BY isolated_at",
+                (user_id,),
+            ).fetchall()
+        return [_row_to_record(r) for r in rows]
 
     def list_active(self) -> list[IsolationRecord]:
-        """Все активные изоляции, старейшие первыми (см. list_pending()
-        в moderation_store.py — тот же принцип: дольше всех ждущие
+        """Все активные изоляции, старейшие первыми (тот же принцип, что
+        list_pending() в moderation_store.py: дольше всех ждущие
         разбираются в первую очередь)."""
-        return sorted(
-            (r for r in self._records.values() if r.is_active),
-            key=lambda r: r.isolated_at,
-        )
+        with db.transaction() as conn:
+            rows = conn.execute(
+                f"SELECT {_I_COLS} FROM isolation_records WHERE lifted_at IS NULL ORDER BY isolated_at"
+            ).fetchall()
+        return [_row_to_record(r) for r in rows]
 
     def lift(self, user_id: str, lifted_by: str) -> IsolationRecord:
-        record = self._records.get(user_id)
-        if record is None or not record.is_active:
+        with db.transaction() as conn:
+            row = conn.execute(
+                f"UPDATE isolation_records SET lifted_at = now(), lifted_by = %s "
+                f"WHERE user_id = %s AND lifted_at IS NULL RETURNING {_I_COLS}",
+                (lifted_by, user_id),
+            ).fetchone()
+        if row is None:
             raise IsolationError(f"Пользователь {user_id} не изолирован")
-        record.lifted_at = time.time()
-        record.lifted_by = lifted_by
         logger.info("Изоляция снята: %s (снял %s)", user_id, lifted_by)
-        return record
+        return _row_to_record(row)

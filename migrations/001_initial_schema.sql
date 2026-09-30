@@ -15,9 +15,11 @@
 --   * ENUM-ы — TEXT + CHECK, а не CREATE TYPE: новое значение = правка CHECK,
 --     без ALTER TYPE; тот же вид, что str-Enum в Python.
 --   * Драйвер синхронный (psycopg 3 sync), §9.7 архитектуры.
+--
+-- Файл применяется через `python -m core.migrate` — он сам оборачивает
+-- файл и отметку в schema_migrations в одну транзакцию, поэтому здесь
+-- нет BEGIN/COMMIT.
 -- =============================================================================
-
-BEGIN;
 
 -- -----------------------------------------------------------------------------
 -- 1. users  (core/auth_store.py)
@@ -406,5 +408,3 @@ $$;
 CREATE TRIGGER moderation_decisions_append_only
     BEFORE UPDATE OR DELETE ON moderation_decisions
     FOR EACH ROW EXECUTE FUNCTION forbid_modification();
-
-COMMIT;
