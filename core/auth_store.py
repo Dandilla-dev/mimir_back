@@ -20,7 +20,16 @@ core/auth_store.py — пользователи и сессионные токе
 действует SESSION_LIFETIME с момента входа (sessions.expires_at), потом
 нужен повторный вход. Просроченные строки чистит
 purge_expired_sessions() из той же фоновой задачи, что и стирание
-отклонённых сообщений (api/server.py).
+отклонённых сообщений (api/server.py). Смена пароля завершает все
+остальные сессии пользователя — текущая (с которой меняли) остаётся.
+
+ПЕРЕБОР ПАРОЛЕЙ (миграция 003): каждая попытка входа пишется в
+login_attempts. За LOGIN_WINDOW допускается MAX_FAILURES_PER_EMAIL
+неудач по одному email (считаются после последнего удачного входа) и
+MAX_FAILURES_PER_IP неудач с одного IP — дальше LoginThrottled (HTTP 429)
+до тех пор, пока старые неудачи не выйдут из окна. Неверный текущий
+пароль при смене пароля считается такой же неудачей — иначе перебор
+можно было бы вести через украденную сессию.
 """
 
 from __future__ import annotations
@@ -47,8 +56,24 @@ SESSION_LIFETIME = timedelta(days=int(os.getenv("SESSION_LIFETIME_DAYS", "30")))
 BCRYPT_ROUNDS = int(os.getenv("BCRYPT_ROUNDS", "12"))
 
 
+LOGIN_WINDOW = timedelta(minutes=15)
+MAX_FAILURES_PER_EMAIL = 5
+MAX_FAILURES_PER_IP = 20
+
+
 class AuthError(Exception):
     """Ошибка регистрации/логина (email занят, неверный пароль и т.д.)."""
+
+
+class LoginThrottled(AuthError):
+    """Слишком много неудачных попыток — вход временно закрыт.
+    retry_after — через сколько секунд можно пробовать снова."""
+
+    def __init__(self, retry_after: int):
+        super().__init__(
+            f"Слишком много неудачных попыток входа. Попробуйте через {retry_after} с"
+        )
+        self.retry_after = retry_after
 
 
 @dataclass
@@ -133,13 +158,16 @@ class AuthStore:
         logger.info("Зарегистрирован пользователь: %s (%s)", user.email, user.user_id)
         return user
 
-    def login(self, email: str, password: str) -> tuple[User, str]:
+    def login(self, email: str, password: str, ip: str | None = None) -> tuple[User, str]:
         email = email.strip().lower()
+        self._check_throttle(email, ip)
         user = self._user_by_email(email)
         if user is None or not _password_matches(user, password):
+            self._record_attempt(email, ip, succeeded=False)
             # Намеренно одна и та же ошибка для "нет юзера" и "неверный пароль",
             # чтобы не палить, какие email зарегистрированы.
             raise AuthError("Неверный email или пароль")
+        self._record_attempt(email, ip, succeeded=True)
 
         token = secrets.token_urlsafe(24)
         with db.transaction() as conn:
@@ -193,6 +221,91 @@ class AuthStore:
     def logout(self, token: str) -> None:
         with db.transaction() as conn:
             conn.execute("DELETE FROM sessions WHERE token_hash = %s", (_token_hash(token),))
+
+    # --------- Смена пароля ---------
+
+    def change_password(
+        self, user: User, current_password: str, new_password: str,
+        keep_token: str, ip: str | None = None,
+    ) -> int:
+        """Меняет пароль и завершает все ОСТАЛЬНЫЕ сессии пользователя
+        (на случай, если старый пароль утёк и кто-то уже вошёл). Сессия
+        keep_token, с которой меняли пароль, остаётся. Возвращает число
+        завершённых сессий."""
+        self._check_throttle(user.email, ip)
+        fresh = self.user_by_id(user.user_id)  # хэш из БД, а не из кэша запроса
+        if fresh is None or not _password_matches(fresh, current_password):
+            self._record_attempt(user.email, ip, succeeded=False)
+            raise AuthError("Неверный текущий пароль")
+        if len(new_password) < MIN_PASSWORD_LENGTH:
+            raise AuthError(f"Пароль слишком короткий (мин. {MIN_PASSWORD_LENGTH} символов)")
+        if new_password == current_password:
+            raise AuthError("Новый пароль совпадает с текущим")
+
+        with db.transaction() as conn:
+            conn.execute(
+                "UPDATE users SET password_hash = %s, salt = NULL WHERE user_id = %s",
+                (_hash_password(new_password), user.user_id),
+            )
+            cur = conn.execute(
+                "DELETE FROM sessions WHERE user_id = %s AND token_hash <> %s",
+                (user.user_id, _token_hash(keep_token)),
+            )
+            revoked = cur.rowcount
+        logger.info("Пароль изменён: %s (завершено других сессий: %d)", user.email, revoked)
+        return revoked
+
+    # --------- Защита от перебора ---------
+
+    def _record_attempt(self, email: str, ip: str | None, succeeded: bool) -> None:
+        with db.transaction() as conn:
+            conn.execute(
+                "INSERT INTO login_attempts (email, ip, succeeded) VALUES (%s, %s, %s)",
+                (email, ip, succeeded),
+            )
+
+    def _check_throttle(self, email: str, ip: str | None) -> None:
+        with db.transaction() as conn:
+            by_email = conn.execute(
+                """
+                SELECT attempted_at FROM login_attempts
+                WHERE email = %(email)s AND NOT succeeded
+                  AND attempted_at > now() - %(window)s
+                  AND attempted_at > COALESCE(
+                      (SELECT max(attempted_at) FROM login_attempts
+                       WHERE email = %(email)s AND succeeded), '-infinity')
+                ORDER BY attempted_at
+                """,
+                {"email": email, "window": LOGIN_WINDOW},
+            ).fetchall()
+            by_ip = []
+            if ip is not None:
+                by_ip = conn.execute(
+                    "SELECT attempted_at FROM login_attempts "
+                    "WHERE ip = %s AND NOT succeeded AND attempted_at > now() - %s "
+                    "ORDER BY attempted_at",
+                    (ip, LOGIN_WINDOW),
+                ).fetchall()
+            now = conn.execute("SELECT now() AS now").fetchone()["now"]
+
+        retry_after = 0
+        for rows, limit in ((by_email, MAX_FAILURES_PER_EMAIL), (by_ip, MAX_FAILURES_PER_IP)):
+            if len(rows) >= limit:
+                # Вход откроется, когда из окна выйдет столько старых
+                # неудач, чтобы их осталось меньше лимита.
+                unlock_at = rows[len(rows) - limit]["attempted_at"] + LOGIN_WINDOW
+                retry_after = max(retry_after, int((unlock_at - now).total_seconds()) + 1)
+        if retry_after > 0:
+            logger.warning("Вход временно заблокирован: email=%s ip=%s", email, ip)
+            raise LoginThrottled(retry_after)
+
+    def purge_old_login_attempts(self) -> int:
+        """Попытки входа старше суток для блокировки уже не нужны."""
+        with db.transaction() as conn:
+            cur = conn.execute(
+                "DELETE FROM login_attempts WHERE attempted_at < now() - interval '1 day'"
+            )
+            return cur.rowcount
 
     def purge_expired_sessions(self) -> int:
         """Удаляет просроченные сессии. Возвращает их число. Сами по себе

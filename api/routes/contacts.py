@@ -7,7 +7,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends, HTTPException
 
 from api.deps import contacts_store, get_current_user
-from api.schemas import ContactsListResponse, ContactsSyncRequest, contact_to_out
+from api.schemas import ContactIn, ContactOut, ContactsListResponse, ContactsSyncRequest, contact_to_out
 from core.auth_store import User
 from core.contacts_store import ContactsError
 
@@ -39,3 +39,18 @@ def delete_contact(contact_id: str, current_user: User = Depends(get_current_use
     except ContactsError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     return {"status": "deleted", "contact_id": contact_id}
+
+
+@router.post("/contacts", response_model=ContactOut)
+def add_contact(req: ContactIn, current_user: User = Depends(get_current_user)):
+    """Добавить один контакт (например, чтобы начать переписку с
+    человеком, которого нет в телефонной книге). Если email совпадает с
+    пользователем Мимира, контакт сразу с ним сопоставляется
+    (linked_user_id) — по нему можно отправлять сообщения."""
+    try:
+        contact = contacts_store.add_contact(
+            current_user.user_id, req.name, phone=req.phone, email=req.email,
+        )
+    except ContactsError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return contact_to_out(contact)

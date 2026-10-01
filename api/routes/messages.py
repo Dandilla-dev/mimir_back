@@ -27,16 +27,20 @@ threat_reasons — см. _threat_decision().
 from __future__ import annotations
 
 import logging
+import mimetypes
+from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile
 from fastapi.concurrency import run_in_threadpool
 
 from api.deps import (
     access_store, auth_store, contacts_store, dlp_events_store, get_current_user,
-    isolation_store, messages_store, moderation_store, org_store, watchlist_store,
+    isolation_store, messages_store, moderation_store, org_store, require_moderation_access,
+    watchlist_store,
 )
 from api.schemas import (
-    MessageOut, MessagePendingModerationOut, MessagesListResponse, message_to_out,
+    ConversationOut, ConversationsListResponse, MessageOut, MessagePendingModerationOut,
+    MessagesListResponse, message_to_out,
 )
 from core import db
 from core.auth_store import User
@@ -244,21 +248,126 @@ def _send_message_tx(
     return message_to_out(message)
 
 
+# --------- Чтение ---------
+#
+# Все списки — постранично: ?limit=N (по умолчанию 50, максимум 200) и
+# ?before=<курсор из next_before предыдущего ответа>. Внутри страницы —
+# от старых к новым, первая страница — самые свежие.
+
+PAGE_LIMIT = Query(50, ge=1, le=200)
+
+
+def _messages_page(page) -> MessagesListResponse:
+    return MessagesListResponse(
+        messages=[message_to_out(m) for m in page.messages],
+        next_before=page.next_before,
+    )
+
+
 @router.get("/messages/history/{other_user_id}", response_model=MessagesListResponse)
 def message_history(
-    other_user_id: str, current_user: User = Depends(get_current_user)
+    other_user_id: str,
+    limit: int = PAGE_LIMIT,
+    before: str | None = None,
+    current_user: User = Depends(get_current_user),
 ):
-    """История 1-на-1 переписки. Групповая история (3+ участников) через REST
-    пока не открыта — messages_store.conversation_history() уже это умеет,
-    эндпоинт для неё можно добавить отдельно, когда появятся групповые чаты
-    на фронте."""
-    history = messages_store.conversation_history(
-        [current_user.user_id, other_user_id]
-    )
-    return MessagesListResponse(messages=[message_to_out(m) for m in history])
+    """История 1-на-1 переписки. Для групп — /conversations/{key}/messages."""
+    return _messages_page(messages_store.conversation_history(
+        [current_user.user_id, other_user_id], limit=limit, before=before,
+    ))
 
 
 @router.get("/messages/inbox", response_model=MessagesListResponse)
-def message_inbox(current_user: User = Depends(get_current_user)):
-    inbox = messages_store.inbox(current_user.user_id)
-    return MessagesListResponse(messages=[message_to_out(m) for m in inbox])
+def message_inbox(
+    limit: int = PAGE_LIMIT,
+    before: str | None = None,
+    current_user: User = Depends(get_current_user),
+):
+    """Все доставленные сообщения пользователя (входящие и исходящие) —
+    общая лента. Для экрана чатов удобнее /conversations."""
+    return _messages_page(messages_store.inbox(current_user.user_id, limit=limit, before=before))
+
+
+@router.get("/conversations", response_model=ConversationsListResponse)
+def list_conversations(
+    limit: int = PAGE_LIMIT,
+    before: str | None = None,
+    current_user: User = Depends(get_current_user),
+):
+    """Список чатов: по одному на каждый набор участников (1-на-1 или
+    группа), с последним сообщением, свежие первыми. Имена участников —
+    через /users?ids=..."""
+    page = messages_store.conversations(current_user.user_id, limit=limit, before=before)
+    return ConversationsListResponse(
+        conversations=[ConversationOut(**vars(c)) for c in page.conversations],
+        next_before=page.next_before,
+    )
+
+
+@router.get("/conversations/{conversation_key}/messages", response_model=MessagesListResponse)
+def conversation_messages(
+    conversation_key: str,
+    limit: int = PAGE_LIMIT,
+    before: str | None = None,
+    current_user: User = Depends(get_current_user),
+):
+    """Сообщения одного чата по conversation_key из /conversations —
+    работает и для групп. Только для участника этого чата."""
+    participants = conversation_key.split(":")
+    if current_user.user_id not in participants:
+        raise HTTPException(status_code=404, detail="Чат не найден")
+    return _messages_page(messages_store.conversation_history(
+        participants, limit=limit, before=before,
+    ))
+
+
+@router.get("/messages/{message_id}/attachments/{attachment_id}")
+def download_attachment(
+    message_id: str, attachment_id: str, current_user: User = Depends(get_current_user),
+):
+    """Содержимое вложения. Кто может скачать:
+    - получатель — только доставленного сообщения (удержанное или
+      отклонённое он не должен видеть даже по прямой ссылке);
+    - отправитель — своё сообщение в любом статусе, пока содержимое не
+      стёрто ([РЕШЕНИЕ 10]);
+    - security_officer — вложение удержанного сообщения своей организации,
+      чтобы принять решение по модерации.
+    Всем остальным — 404, как будто вложения нет (не подтверждаем, что
+    такой id существует).
+
+    Файл всегда отдаётся на скачивание (Content-Disposition: attachment),
+    а не открывается в браузере: иначе присланный HTML/SVG выполнился бы
+    как страница нашего сайта."""
+    not_found = HTTPException(status_code=404, detail="Вложение не найдено")
+    try:
+        message, attachment = messages_store.get_attachment(message_id, attachment_id)
+    except MessagesError as exc:
+        if "удалено" in str(exc):
+            raise HTTPException(status_code=410, detail=str(exc)) from exc
+        raise not_found from exc
+
+    me = current_user.user_id
+    allowed = (
+        message.sender_id == me
+        or (me in message.recipient_ids and message.status == MessageStatus.DELIVERED)
+    )
+    if not allowed and message.status == MessageStatus.PENDING_MODERATION:
+        pending = moderation_store.get_open_by_message(message_id)
+        if pending is not None:
+            try:
+                require_moderation_access(pending.org_id, current_user)
+                allowed = True
+            except HTTPException:
+                pass
+    if not allowed:
+        raise not_found
+
+    media_type = mimetypes.guess_type(attachment.filename)[0] or "application/octet-stream"
+    return Response(
+        content=attachment.content,
+        media_type=media_type,
+        headers={
+            "Content-Disposition": f"attachment; filename*=UTF-8''{quote(attachment.filename)}",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )

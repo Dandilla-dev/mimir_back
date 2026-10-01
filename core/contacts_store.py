@@ -144,6 +144,16 @@ class ContactsStore:
             ).fetchall()
         return [_row_to_contact(r) for r in rows]
 
+    def has_linked_contact(self, owner_user_id: str, linked_user_id: str) -> bool:
+        """Есть ли у владельца контакт, сопоставленный с этим пользователем
+        Мимира — используется для видимости профилей (api/routes/users.py)."""
+        with db.transaction() as conn:
+            row = conn.execute(
+                "SELECT 1 FROM contacts WHERE owner_user_id = %s AND linked_user_id = %s LIMIT 1",
+                (owner_user_id, linked_user_id),
+            ).fetchone()
+        return row is not None
+
     def remove_contact(self, owner_user_id: str, contact_id: str) -> None:
         with db.transaction() as conn:
             cur = conn.execute(

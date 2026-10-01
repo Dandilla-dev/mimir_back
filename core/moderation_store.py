@@ -131,6 +131,17 @@ class ModerationStore:
             raise ModerationError(f"Запись модерации {hold_id} не найдена")
         return self._row_to_pending(row)
 
+    def get_open_by_message(self, message_id: str) -> PendingMessage | None:
+        """Открытое удержание этого сообщения, если есть — чтобы officer
+        мог открыть вложение удержанного сообщения перед решением."""
+        with db.transaction() as conn:
+            row = conn.execute(
+                f"SELECT {_H_COLS} FROM moderation_holds "
+                "WHERE message_id = %s AND resolved_at IS NULL",
+                (message_id,),
+            ).fetchone()
+        return self._row_to_pending(row) if row else None
+
     def list_pending(self, org_ids: list[str] | None = None) -> list[PendingMessage]:
         """Открытые удержания, старейшие первыми (их нужно разбирать в
         первую очередь). org_ids — фильтр по организациям (для очереди

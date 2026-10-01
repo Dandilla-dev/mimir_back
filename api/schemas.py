@@ -101,6 +101,40 @@ class MessageOut(BaseModel):
 
 class MessagesListResponse(BaseModel):
     messages: list[MessageOut]
+    # Курсор следующей (более старой) страницы: передать как ?before=...
+    # None — старее сообщений нет.
+    next_before: str | None = None
+
+
+class ConversationOut(BaseModel):
+    conversation_key: str
+    participant_ids: list[str]
+    last_message_id: str
+    last_sender_id: str
+    last_text_preview: str
+    last_sent_at: float
+    last_has_attachments: bool
+    message_count: int
+
+
+class ConversationsListResponse(BaseModel):
+    conversations: list[ConversationOut]
+    next_before: str | None = None
+
+
+class UserPublicOut(BaseModel):
+    user_id: str
+    email: str
+    name: str
+
+
+class UsersListResponse(BaseModel):
+    users: list[UserPublicOut]
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str
 
 
 class MessagePendingModerationOut(BaseModel):

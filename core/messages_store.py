@@ -114,6 +114,34 @@ def _sha256(data: bytes) -> str:
 
 
 _MSG_COLS = "message_id, sender_id, text, device_id, status, sent_at"
+CONVERSATION_PREVIEW_CHARS = 100
+
+
+@dataclass
+class MessagePage:
+    """Страница сообщений: от старых к новым; next_before — курсор для
+    следующей (более старой) страницы, None — это последняя."""
+    messages: list[Message]
+    next_before: str | None = None
+
+
+@dataclass
+class ConversationSummary:
+    """Один чат в списке чатов: набор участников и последнее сообщение."""
+    conversation_key: str
+    participant_ids: list[str]
+    last_message_id: str
+    last_sender_id: str
+    last_text_preview: str
+    last_sent_at: float
+    last_has_attachments: bool
+    message_count: int
+
+
+@dataclass
+class ConversationPage:
+    conversations: list[ConversationSummary]
+    next_before: str | None = None
 
 
 class MessagesStore:
@@ -283,29 +311,171 @@ class MessagesStore:
                 raise MessagesError(f"Сообщение {message_id} не найдено")
             return self._hydrate(conn, [row], with_content)[0]
 
-    def conversation_history(self, participant_ids: list[str]) -> list[Message]:
-        """История переписки между заданными участниками, по времени отправки."""
-        with db.transaction() as conn:
-            rows = conn.execute(
-                f"SELECT {_MSG_COLS} FROM messages "
-                "WHERE conversation_key = %s AND status = 'delivered' ORDER BY sent_at",
-                (_conversation_key(participant_ids),),
-            ).fetchall()
-            return self._hydrate(conn, rows)
+    def conversation_history(
+        self,
+        participant_ids: list[str],
+        limit: int | None = None,
+        before: str | None = None,
+    ) -> MessagePage:
+        """История переписки ровно этого набора участников (1-на-1 или
+        группа). Постранично, см. MessagePage."""
+        return self._page(
+            "m.conversation_key = %(key)s",
+            {"key": _conversation_key(participant_ids)},
+            limit, before,
+        )
 
-    def inbox(self, user_id: str) -> list[Message]:
+    def inbox(
+        self, user_id: str, limit: int | None = None, before: str | None = None,
+    ) -> MessagePage:
         """Все доставленные сообщения, где user_id — отправитель или
-        получатель, по времени."""
+        получатель. Постранично, см. MessagePage."""
+        return self._page(
+            "(m.sender_id = %(me)s OR EXISTS ("
+            "  SELECT 1 FROM message_recipients r "
+            "  WHERE r.message_id = m.message_id AND r.recipient_id = %(me)s))",
+            {"me": user_id},
+            limit, before,
+        )
+
+    def _page(
+        self, where: str, params: dict, limit: int | None, before: str | None,
+    ) -> MessagePage:
+        """Общая постраничная выборка доставленных сообщений.
+
+        Курсор — message_id: страница = limit сообщений, отправленных
+        строго раньше сообщения before (или самых новых, если before нет).
+        Не OFFSET: при новых сообщениях OFFSET сдвигает страницы и даёт
+        дубли/пропуски, курсор — нет. Внутри страницы порядок — от старых
+        к новым (как показывать в чате); next_before — курсор следующей,
+        более старой страницы, None — старее ничего нет."""
+        query = (
+            f"SELECT {', '.join('m.' + c for c in _MSG_COLS.split(', '))} FROM messages m "
+            f"WHERE m.status = 'delivered' AND {where}"
+        )
+        params = dict(params)
+        if before is not None:
+            query += (
+                " AND (m.sent_at, m.message_id) < "
+                "(SELECT sent_at, message_id FROM messages WHERE message_id = %(before)s)"
+            )
+            params["before"] = before
+        query += " ORDER BY m.sent_at DESC, m.message_id DESC"
+        if limit is not None:
+            query += " LIMIT %(limit)s"
+            params["limit"] = limit + 1  # +1 — узнать, есть ли следующая страница
+        with db.transaction() as conn:
+            rows = conn.execute(query, params).fetchall()
+            has_more = limit is not None and len(rows) > limit
+            rows = rows[:limit] if limit is not None else rows
+            messages = self._hydrate(conn, list(reversed(rows)))
+        return MessagePage(
+            messages=messages,
+            next_before=messages[0].message_id if has_more and messages else None,
+        )
+
+    def conversations(
+        self, user_id: str, limit: int = 50, before: str | None = None,
+    ) -> ConversationPage:
+        """Список чатов пользователя: по одному на каждый набор участников,
+        с последним сообщением, сначала самые свежие. Постранично: before —
+        last_message_id последнего чата предыдущей страницы."""
+        params: dict = {"me": user_id, "limit": limit + 1}
+        cursor = ""
+        if before is not None:
+            cursor = (
+                "WHERE (last.sent_at, last.message_id) < "
+                "(SELECT sent_at, message_id FROM messages WHERE message_id = %(before)s)"
+            )
+            params["before"] = before
         with db.transaction() as conn:
             rows = conn.execute(
-                f"SELECT {_MSG_COLS} FROM messages m "
-                "WHERE m.status = 'delivered' AND (m.sender_id = %s OR EXISTS ("
-                "  SELECT 1 FROM message_recipients r "
-                "  WHERE r.message_id = m.message_id AND r.recipient_id = %s)) "
-                "ORDER BY m.sent_at",
-                (user_id, user_id),
+                f"""
+                WITH mine AS (
+                    SELECT m.message_id, m.conversation_key, m.sender_id, m.text, m.sent_at
+                    FROM messages m
+                    WHERE m.status = 'delivered' AND (m.sender_id = %(me)s OR EXISTS (
+                        SELECT 1 FROM message_recipients r
+                        WHERE r.message_id = m.message_id AND r.recipient_id = %(me)s))
+                ),
+                last AS (
+                    SELECT DISTINCT ON (conversation_key) *
+                    FROM mine
+                    ORDER BY conversation_key, sent_at DESC, message_id DESC
+                )
+                SELECT last.*,
+                       (SELECT count(*) FROM mine
+                        WHERE mine.conversation_key = last.conversation_key) AS message_count,
+                       EXISTS (SELECT 1 FROM attachments a
+                               WHERE a.message_id = last.message_id) AS has_attachments
+                FROM last
+                {cursor}
+                ORDER BY last.sent_at DESC, last.message_id DESC
+                LIMIT %(limit)s
+                """,
+                params,
             ).fetchall()
-            return self._hydrate(conn, rows)
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        items = [
+            ConversationSummary(
+                conversation_key=r["conversation_key"],
+                participant_ids=r["conversation_key"].split(":"),
+                last_message_id=r["message_id"],
+                last_sender_id=r["sender_id"],
+                last_text_preview=(r["text"] or "")[:CONVERSATION_PREVIEW_CHARS],
+                last_sent_at=db.from_db_time(r["sent_at"]),
+                last_has_attachments=r["has_attachments"],
+                message_count=r["message_count"],
+            )
+            for r in rows
+        ]
+        return ConversationPage(
+            conversations=items,
+            next_before=items[-1].last_message_id if has_more and items else None,
+        )
+
+    def get_attachment(self, message_id: str, attachment_id: str) -> tuple[Message, Attachment]:
+        """Вложение с байтами + его сообщение (в любом статусе — права
+        проверяет api/, см. api/routes/messages.py). Стёртое вложение
+        отклонённого сообщения ([РЕШЕНИЕ 10]) — MessagesError."""
+        message = self.get_message(message_id)
+        with db.transaction() as conn:
+            row = conn.execute(
+                "SELECT attachment_id, filename, size_bytes, content, purged_at "
+                "FROM attachments WHERE message_id = %s AND attachment_id = %s",
+                (message_id, attachment_id),
+            ).fetchone()
+        if row is None:
+            raise MessagesError("Вложение не найдено")
+        if row["purged_at"] is not None or row["content"] is None:
+            raise MessagesError("Содержимое вложения удалено")
+        return message, Attachment(
+            attachment_id=row["attachment_id"],
+            filename=row["filename"],
+            content=bytes(row["content"]),
+            size_bytes=row["size_bytes"],
+        )
+
+    def have_conversed(self, user_a: str, user_b: str) -> bool:
+        """Есть ли хоть одно доставленное сообщение между двумя
+        пользователями (в любую сторону, в том числе в группе)."""
+        with db.transaction() as conn:
+            row = conn.execute(
+                """
+                SELECT 1 FROM messages m
+                JOIN message_recipients r ON r.message_id = m.message_id
+                WHERE m.status = 'delivered'
+                  AND ((m.sender_id = %(a)s AND r.recipient_id = %(b)s)
+                    OR (m.sender_id = %(b)s AND r.recipient_id = %(a)s)
+                    OR (r.recipient_id = %(a)s AND EXISTS (
+                          SELECT 1 FROM message_recipients r2
+                          WHERE r2.message_id = m.message_id AND r2.recipient_id = %(b)s)))
+                LIMIT 1
+                """,
+                {"a": user_a, "b": user_b},
+            ).fetchone()
+        return row is not None
 
     @staticmethod
     def _hydrate(conn, rows: list[dict], with_content: bool = False) -> list[Message]:

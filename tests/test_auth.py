@@ -80,3 +80,49 @@ def test_session_expires(api, client):
         conn.execute("UPDATE sessions SET expires_at = now() - interval '1 second'")
     assert client.get("/auth/me", headers=headers).status_code == 401
     assert AuthStore().purge_expired_sessions() == 1
+
+
+def test_login_throttled_after_five_failures(api, client):
+    api.register("anna@example.com")
+    for _ in range(5):
+        r = client.post("/auth/login", json={"email": "anna@example.com", "password": "wrong-pass"})
+        assert r.status_code == 401
+    r = client.post("/auth/login", json={"email": "anna@example.com", "password": PASSWORD})
+    assert r.status_code == 429, "даже верный пароль — после 5 неудач"
+    assert int(r.headers["retry-after"]) > 0
+    # для несуществующего email — то же поведение (не выдаём, кто зарегистрирован)
+    for _ in range(5):
+        client.post("/auth/login", json={"email": "ghost@example.com", "password": "wrong-pass"})
+    assert client.post("/auth/login", json={"email": "ghost@example.com", "password": "x"}).status_code == 429
+
+
+def test_lock_expires_and_success_resets(api, client):
+    api.register("anna@example.com")
+    for _ in range(4):
+        client.post("/auth/login", json={"email": "anna@example.com", "password": "wrong-pass"})
+    assert client.post("/auth/login", json={"email": "anna@example.com", "password": PASSWORD}).status_code == 200
+    for _ in range(4):
+        r = client.post("/auth/login", json={"email": "anna@example.com", "password": "wrong-pass"})
+    assert r.status_code == 401, "счёт после удачного входа начался заново"
+    client.post("/auth/login", json={"email": "anna@example.com", "password": "wrong-pass"})
+    assert client.post("/auth/login", json={"email": "anna@example.com", "password": PASSWORD}).status_code == 429
+    with db.transaction() as conn:
+        conn.execute("UPDATE login_attempts SET attempted_at = attempted_at - interval '16 minutes'")
+    assert client.post("/auth/login", json={"email": "anna@example.com", "password": PASSWORD}).status_code == 200
+
+
+def test_change_password(api, client):
+    _, h1 = api.register("anna@example.com")
+    token2 = client.post("/auth/login", json={"email": "anna@example.com", "password": PASSWORD}).json()["token"]
+    h2 = {"Authorization": f"Bearer {token2}"}
+
+    bad = client.post("/auth/password", json={"current_password": "wrong-pass", "new_password": "newpassword1"}, headers=h1)
+    assert bad.status_code == 400
+    short = client.post("/auth/password", json={"current_password": PASSWORD, "new_password": "short"}, headers=h1)
+    assert short.status_code == 400
+
+    r = client.post("/auth/password", json={"current_password": PASSWORD, "new_password": "newpassword1"}, headers=h1)
+    assert r.status_code == 200 and r.json()["other_sessions_revoked"] == 1
+    assert client.get("/auth/me", headers=h1).status_code == 200, "текущая сессия остаётся"
+    assert client.get("/auth/me", headers=h2).status_code == 401, "другие завершены"
+    assert client.post("/auth/login", json={"email": "anna@example.com", "password": "newpassword1"}).status_code == 200

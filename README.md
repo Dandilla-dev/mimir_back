@@ -38,6 +38,10 @@ python -m core.migrate         # применить новые миграции 
 uvicorn api.server:app --reload
 ```
 
+За обратным прокси (Nginx) добавьте `--proxy-headers --forwarded-allow-ips=<адрес прокси>`:
+иначе сервер будет видеть адрес прокси вместо адреса клиента, и лимит
+попыток входа по IP станет общим для всех пользователей.
+
 Интерактивная документация всех эндпоинтов: http://localhost:8000/docs
 
 ## Автотесты
@@ -80,15 +84,30 @@ tests/      — автотесты (pytest)
 `/link-whitelist/default`, требуют `Authorization: Bearer <token>`.
 
 **Авторизация.** Пароль — от 8 символов, сессия действует 30 дней.
+После 5 неудачных попыток входа по одному email (или 20 с одного IP) за
+15 минут вход временно закрыт — ответ `429` с заголовком `Retry-After`.
 - `POST /auth/register`, `POST /auth/login`, `POST /auth/logout`, `GET /auth/me`
+- `POST /auth/password` `{"current_password", "new_password"}` — сменить пароль; все остальные сессии завершаются
+
+**Пользователи.** Профиль виден только связанным: коллегам по организации,
+собеседникам и тем, у кого человек в контактах.
+- `GET /users/{user_id}`, `GET /users?ids=a&ids=b` — имя и email
 
 **Контакты.**
 - `POST /contacts/sync` — заменить список контактов присланным
+- `POST /contacts` `{"name", "email", "phone"}` — добавить один (если email принадлежит пользователю Мимира, контакт с ним сопоставляется)
 - `GET /contacts`, `DELETE /contacts/{contact_id}`
 
 **Сообщения** (с DLP-проверкой на отправке).
 - `POST /messages/send` — multipart/form-data: `recipient_ids` (повторяющееся поле), `text`, `files`, `device_id`. Исходящий THREAT → ответ `pending_moderation` и удержание до решения officer'а; входящий THREAT → сообщение доставляется, получатель изолируется
-- `GET /messages/inbox`, `GET /messages/history/{other_user_id}`
+- `GET /conversations` — список чатов с последним сообщением, свежие первыми
+- `GET /conversations/{conversation_key}/messages` — сообщения чата (и группового)
+- `GET /messages/history/{other_user_id}` — переписка 1-на-1
+- `GET /messages/inbox` — общая лента всех сообщений
+- `GET /messages/{message_id}/attachments/{attachment_id}` — скачать вложение (получатель — только доставленного; officer — удержанного в своей организации)
+
+Списки постраничные: `?limit=50` (до 200) и `?before=<next_before из прошлого ответа>`.
+Первая страница — самые свежие, внутри страницы — от старых к новым.
 
 **Модерация** (security_officer своей организации).
 - `GET /moderation/pending` — очередь удержанных

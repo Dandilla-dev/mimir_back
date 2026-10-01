@@ -21,15 +21,15 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.deps import auth_store, messages_store, settings
-from api.routes import assistant, auth, contacts, messages, moderation, org_dlp, orgs
+from api.routes import assistant, auth, contacts, messages, moderation, org_dlp, orgs, users
 from core import db
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("mimir.api")
 
 # Как часто фоновая задача убирает просроченное: содержимое сообщений,
-# отклонённых модерацией больше суток назад ([РЕШЕНИЕ 10]), и
-# просроченные сессии.
+# отклонённых модерацией больше суток назад ([РЕШЕНИЕ 10]), просроченные
+# сессии и старые записи попыток входа.
 PURGE_INTERVAL_SECONDS = int(os.getenv("PURGE_INTERVAL_SECONDS", "3600"))
 
 
@@ -38,7 +38,11 @@ async def _purge_loop() -> None:
     потоке, чтобы не блокировать event loop. Сбой одной итерации
     логируется и не останавливает цикл."""
     while True:
-        for job in (messages_store.purge_rejected_content, auth_store.purge_expired_sessions):
+        for job in (
+            messages_store.purge_rejected_content,
+            auth_store.purge_expired_sessions,
+            auth_store.purge_old_login_attempts,
+        ):
             try:
                 await asyncio.to_thread(job)
             except Exception:
@@ -67,7 +71,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-for module in (auth, contacts, messages, moderation, orgs, org_dlp, assistant):
+for module in (auth, users, contacts, messages, moderation, orgs, org_dlp, assistant):
     app.include_router(module.router)
 
 
