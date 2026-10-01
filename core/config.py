@@ -3,7 +3,8 @@ core/config.py — настройки и переменные окружения
 
 Читает:
 - config.yaml  (общие, не секретные параметры)
-- .env         (секреты: API-ключи)
+- .env         (секреты и то, что отличается между машинами: API-ключи,
+                DATABASE_URL, CORS_ORIGINS, LOAD_LOCAL_MODEL)
 """
 
 from __future__ import annotations
@@ -47,11 +48,30 @@ class VoiceConfig:
     elevenlabs_voice_id: str | None = None
 
 
+DEFAULT_CORS_ORIGINS = ("http://localhost:5173", "http://127.0.0.1:5173")
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() in ("1", "true", "yes")
+
+
 @dataclass
 class ServerConfig:
     host: str = "0.0.0.0"
     port: int = 8000
     debug: bool = False
+    # Адреса фронтенда, которым браузер разрешит обращаться к API.
+    # CORS_ORIGINS в .env — через запятую. По умолчанию — Vite dev-сервер
+    # фронтенда (npm run dev). Раньше было "*" — любой сайт мог слать
+    # запросы от имени вошедшего пользователя.
+    cors_origins: tuple[str, ...] = DEFAULT_CORS_ORIGINS
+    # Локальная нейросеть (models/local_model.py). Нужен PyTorch
+    # (requirements-ml.txt). По умолчанию выключена: обученных весов ещё
+    # нет, со случайными весами она только тратит память и время запуска.
+    load_local_model: bool = False
 
 
 @dataclass
@@ -94,6 +114,10 @@ class Settings:
                 host=server_raw.get("host", ServerConfig.host),
                 port=server_raw.get("port", ServerConfig.port),
                 debug=server_raw.get("debug", ServerConfig.debug),
+                cors_origins=tuple(
+                    o.strip() for o in os.getenv("CORS_ORIGINS", "").split(",") if o.strip()
+                ) or DEFAULT_CORS_ORIGINS,
+                load_local_model=_env_flag("LOAD_LOCAL_MODEL", ServerConfig.load_local_model),
             ),
         )
 

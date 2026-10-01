@@ -1,6 +1,6 @@
 """
 core/isolation_store.py — автоматическая изоляция аккаунта после входящего
-THREAT (фишинг). Закрывает открытый вопрос 1 (см. обсуждение в чате).
+THREAT (фишинг). Закрывает открытый вопрос 1.
 
 КОНТЕКСТ РЕШЕНИЯ: удерживать/блокировать каждое входящее THREAT-сообщение
 до решения security_officer не масштабируется — входящий THREAT завязан
@@ -20,7 +20,7 @@ THREAT (фишинг). Закрывает открытый вопрос 1 (см.
 скомпрометирован (перешёл по ссылке/открыл вложение до того, как кто-то
 это заметил).
 
-ПРИМЕНИМОСТЬ (см. обсуждение в чате): изоляция накладывается ТОЛЬКО на
+ПРИМЕНИМОСТЬ: изоляция накладывается ТОЛЬКО на
 org-linked пользователей. Для personal-аккаунтов (без организации)
 автоизоляция не применяется вообще — снять её было бы некому, у personal
 нет security_officer (та же логика, что уже применена к moderation_store
@@ -106,13 +106,22 @@ def _row_to_record(row: dict) -> IsolationRecord:
 class IsolationStore:
     """Изоляции пользователей с историей — PostgreSQL."""
 
-    def isolate(self, user_id: str, threat_reasons: list[str]) -> IsolationRecord:
+    def isolate(
+        self, user_id: str, threat_reasons: list[str], message_id: str | None = None,
+    ) -> IsolationRecord:
         """Накладывает изоляцию. Если пользователь уже активно изолирован —
         НЕ создаёт вторую запись и не сбрасывает isolated_at: повторный
         THREAT во время уже действующей изоляции — это дополнительное
         подтверждение риска, а не повод начинать отсчёт заново. Новые
         причины добавляются к уже накопленным (без дублей, порядок
         первого появления сохраняется).
+
+        message_id — сообщение, вызвавшее изоляцию (или повторный THREAT
+        во время неё). Пишется в isolation_triggers: через эту связь вердикт
+        officer'а при снятии изоляции доходит до конкретных DLP-событий —
+        метки датасета для входящих (миграция 002, представление
+        dlp_dataset). Сообщение в этот момент ещё не сохранено — FK
+        отложен до конца транзакции /messages/send.
 
         Одним запросом (INSERT ... ON CONFLICT по частичному индексу
         активной изоляции) — две одновременные изоляции одного
@@ -137,6 +146,12 @@ class IsolationStore:
                 """,
                 (secrets.token_hex(8), user_id, db.jsonb(threat_reasons)),
             ).fetchone()
+            if message_id is not None:
+                conn.execute(
+                    "INSERT INTO isolation_triggers (isolation_id, message_id) "
+                    "VALUES (%s, %s) ON CONFLICT DO NOTHING",
+                    (row["isolation_id"], message_id),
+                )
         if row["inserted"]:
             logger.info("Аккаунт %s изолирован: reasons=%s", user_id, threat_reasons)
         return _row_to_record(row)

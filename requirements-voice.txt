@@ -1,0 +1,5 @@
+# Голосовой модуль (voice/). API его сейчас не использует.
+-r requirements.txt
+#openai-whisper==20231117
+pyttsx3==2.90
+requests==2.32.3

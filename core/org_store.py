@@ -4,9 +4,9 @@ core/org_store.py — организации и привязка аккаунт�
 Реализует решение, зафиксированное в mimir_account_linkage_v1.md: флаг
 DLP-проверки — свойство аккаунта, а не сообщения. Аккаунт пользователя
 считается "привязанным" к организации только при наличии Membership со
-статусом approved; только тогда мост (Message -> RawMessage, ещё не
-реализован) должен начинать проверять исходящие сообщения этого
-пользователя через core/message_parser.py.
+статусом approved; только тогда мост (Message -> RawMessage) должен начинать проверять исходящие сообщения этого
+пользователя через core/message_parser.py (это делает
+core/message_bridge.py).
 
 Хранение — PostgreSQL, таблицы organizations и memberships
 (migrations/001_initial_schema.sql, раздел 2). Два инварианта, которые
@@ -36,6 +36,22 @@ X есть одобренное членство в организации Y" �
   одновременно (долг §4, пункт 3) — проверяется на approve, не на request:
   подать заявку можно в несколько организаций, но одобрить можно только
   одну, пока остальные не отклонены/отозваны.
+
+РОЛИ (решения 2026-10-01, миграция 002):
+- владелец — создатель организации (Organization.created_by), всегда
+  security_officer, снять с него роль нельзя;
+- заместитель владельца — не больше одного действующего (таблица
+  org_deputies, с историей). Назначает и снимает только владелец.
+  Заместитель может всё, что только владелец: назначать и снимать
+  security_officer, разблокировать изолированного officer'а. Не может
+  назначить своего заместителя и не может передать владение;
+- security_officer назначает и снимает только владелец или заместитель —
+  НЕ другой officer: скомпрометированный officer не должен иметь
+  возможности назначить сообщника. Каждая смена роли пишется в
+  неизменяемый журнал role_changes.
+Права проверяются здесь, в сторе (как и решения по заявкам) — api/
+только превращает OrgError в HTTP-ответ. Изоляция актёра проверяется
+выше, в api/ (стор про изоляцию не знает).
 """
 
 from __future__ import annotations
@@ -252,18 +268,135 @@ class OrgStore:
         return row is not None
 
     def is_owner(self, user_id: str, org_id: str) -> bool:
-        """Владелец организации — тот, кто её создал (Organization.created_by):
-        изолированного security_officer может разблокировать только
-        владелец, не другой officer.
-
-        ПИЛОТНАЯ ЗАГЛУШКА: делегирование прав владельца назначенному
-        лицу пока не реализовано — тот же класс долга, что и "кто
-        назначает первого security_officer"."""
+        """Владелец организации — тот, кто её создал (Organization.created_by)."""
         try:
             org = self.get_organization(org_id)
         except OrgError:
             return False
         return org.created_by == user_id
+
+    def is_owner_or_deputy(self, user_id: str, org_id: str) -> bool:
+        """Право на действия "только владелец": назначение/снятие
+        security_officer, разблокировка изолированного officer'а."""
+        return self.is_owner(user_id, org_id) or self.get_deputy(org_id) == user_id
+
+    # --------- Заместитель владельца ---------
+
+    def get_deputy(self, org_id: str) -> str | None:
+        """user_id действующего заместителя или None."""
+        with db.transaction() as conn:
+            row = conn.execute(
+                "SELECT user_id FROM org_deputies WHERE org_id = %s AND revoked_at IS NULL",
+                (org_id,),
+            ).fetchone()
+        return row["user_id"] if row else None
+
+    def set_deputy(self, org_id: str, user_id: str, owner_user_id: str) -> None:
+        """Назначает заместителя. Прежний заместитель, если был, снимается
+        в той же транзакции (заменяется). Только владелец; заместителем
+        может быть только одобренный член этой организации, не сам
+        владелец."""
+        if not self.is_owner(owner_user_id, org_id):
+            raise OrgError("Назначить заместителя может только владелец организации")
+        if user_id == owner_user_id:
+            raise OrgError("Владелец не может быть собственным заместителем")
+        self._require_member_of(user_id, org_id)
+        with db.transaction() as conn:
+            conn.execute(
+                "UPDATE org_deputies SET revoked_at = now(), revoked_by = %s "
+                "WHERE org_id = %s AND revoked_at IS NULL",
+                (owner_user_id, org_id),
+            )
+            conn.execute(
+                "INSERT INTO org_deputies (entry_id, org_id, user_id, appointed_by) "
+                "VALUES (%s, %s, %s, %s)",
+                (secrets.token_hex(8), org_id, user_id, owner_user_id),
+            )
+        logger.info("Заместитель владельца назначен: %s (org=%s)", user_id, org_id)
+
+    def revoke_deputy(self, org_id: str, owner_user_id: str) -> None:
+        if not self.is_owner(owner_user_id, org_id):
+            raise OrgError("Снять заместителя может только владелец организации")
+        with db.transaction() as conn:
+            cur = conn.execute(
+                "UPDATE org_deputies SET revoked_at = now(), revoked_by = %s "
+                "WHERE org_id = %s AND revoked_at IS NULL",
+                (owner_user_id, org_id),
+            )
+            if cur.rowcount == 0:
+                raise OrgError("У организации нет заместителя")
+        logger.info("Заместитель владельца снят (org=%s)", org_id)
+
+    # --------- Назначение / снятие security_officer ---------
+
+    def appoint_officer(self, org_id: str, user_id: str, actor_user_id: str) -> Membership:
+        """member -> security_officer. Только владелец или заместитель."""
+        return self._change_role(
+            org_id, user_id, actor_user_id,
+            MembershipRole.MEMBER, MembershipRole.SECURITY_OFFICER,
+        )
+
+    def demote_officer(self, org_id: str, user_id: str, actor_user_id: str) -> Membership:
+        """security_officer -> member. Только владелец или заместитель;
+        с владельца роль не снимается."""
+        if self.is_owner(user_id, org_id):
+            raise OrgError("Владелец организации всегда security_officer — снять роль нельзя")
+        return self._change_role(
+            org_id, user_id, actor_user_id,
+            MembershipRole.SECURITY_OFFICER, MembershipRole.MEMBER,
+        )
+
+    def _change_role(
+        self, org_id: str, user_id: str, actor_user_id: str,
+        old_role: MembershipRole, new_role: MembershipRole,
+    ) -> Membership:
+        if not self.is_owner_or_deputy(actor_user_id, org_id):
+            raise OrgError(
+                "Назначать и снимать security_officer может только владелец "
+                "организации или его заместитель"
+            )
+        membership = self._require_member_of(user_id, org_id)
+        if membership.role != old_role:
+            raise OrgError(
+                f"У пользователя роль {membership.role.value}, ожидалась {old_role.value}"
+            )
+        with db.transaction() as conn:
+            row = conn.execute(
+                f"UPDATE memberships SET role = %s "
+                f"WHERE membership_id = %s AND role = %s AND status = 'approved' "
+                f"RETURNING {_M_COLS}",
+                (new_role.value, membership.membership_id, old_role.value),
+            ).fetchone()
+            if row is None:
+                raise OrgError("Роль уже изменена другим запросом")
+            conn.execute(
+                "INSERT INTO role_changes (change_id, membership_id, old_role, new_role, changed_by) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (secrets.token_hex(8), membership.membership_id,
+                 old_role.value, new_role.value, actor_user_id),
+            )
+        logger.info(
+            "Роль изменена: user=%s org=%s %s -> %s (изменил %s)",
+            user_id, org_id, old_role.value, new_role.value, actor_user_id,
+        )
+        return _row_to_membership(row)
+
+    def _require_member_of(self, user_id: str, org_id: str) -> Membership:
+        membership = self.get_active_membership(user_id)
+        if membership is None or membership.org_id != org_id:
+            raise OrgError("Пользователь не состоит в этой организации")
+        return membership
+
+    def list_members(self, org_id: str) -> list[Membership]:
+        """Одобренные члены организации — для выбора, кого назначить
+        officer'ом или заместителем."""
+        with db.transaction() as conn:
+            rows = conn.execute(
+                f"SELECT {_M_COLS} FROM memberships "
+                "WHERE org_id = %s AND status = 'approved' ORDER BY requested_at",
+                (org_id,),
+            ).fetchall()
+        return [_row_to_membership(r) for r in rows]
 
     def approve(self, membership_id: str, decider_user_id: str) -> Membership:
         return self._decide(membership_id, decider_user_id, MembershipStatus.APPROVED)

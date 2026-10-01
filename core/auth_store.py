@@ -6,26 +6,45 @@ core/auth_store.py — пользователи и сессионные токе
 вызывающий код (api/server.py, message_bridge.py, contacts_store.py) не
 трогается.
 
-Токены: клиенту отдаётся сам токен, в БД хранится только его sha256
-([РЕШЕНИЕ 3]) — утечка дампа БД не даёт войти под чужой сессией.
-Срок жизни токенов пока не ограничен (expires_at = NULL), как и было.
+ПАРОЛИ — bcrypt (с 2026-10-01). Соль bcrypt хранится внутри самого
+хэша, поэтому users.salt для новых пользователей NULL. Пользователи,
+зарегистрированные раньше (sha256 + отдельная соль в users.salt),
+входят как прежде; при первом успешном входе их хэш прозрачно
+пересчитывается в bcrypt, а salt обнуляется — без принудительной смены
+пароля. Минимальная длина нового пароля — MIN_PASSWORD_LENGTH; старым
+коротким паролям вход не закрывается, требование действует при
+регистрации.
 
-ВАЖНО: всё ещё заглушка в части криптографии — перед продакшеном:
-- sha256+соль -> bcrypt/argon2 (колонка salt тогда станет NULL);
-- срок жизни сессий (expires_at) и их очистка.
+СЕССИИ: клиенту отдаётся сам токен, в БД хранится только его sha256
+([РЕШЕНИЕ 3]) — утечка дампа БД не даёт войти под чужой сессией. Токен
+действует SESSION_LIFETIME с момента входа (sessions.expires_at), потом
+нужен повторный вход. Просроченные строки чистит
+purge_expired_sessions() из той же фоновой задачи, что и стирание
+отклонённых сообщений (api/server.py).
 """
 
 from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import secrets
 import time
 from dataclasses import dataclass, field
+from datetime import timedelta
+
+import bcrypt
 
 from core import db
 
 logger = logging.getLogger("mimir.auth")
+
+
+MIN_PASSWORD_LENGTH = 8
+SESSION_LIFETIME = timedelta(days=int(os.getenv("SESSION_LIFETIME_DAYS", "30")))
+# Стоимость bcrypt (2^rounds итераций). 12 — разумно для сервера; автотесты
+# ставят 4, чтобы не ждать по ~0.3 с на каждую регистрацию.
+BCRYPT_ROUNDS = int(os.getenv("BCRYPT_ROUNDS", "12"))
 
 
 class AuthError(Exception):
@@ -46,9 +65,22 @@ class User:
         return {"user_id": self.user_id, "email": self.email, "name": self.name}
 
 
-def _hash_password(password: str, salt: str) -> str:
-    """Заглушка хеширования — sha256 с солью. Для продакшена: bcrypt/argon2."""
+def _hash_password(password: str) -> str:
+    """bcrypt: медленный намеренно — перебор утёкших хэшей становится
+    дорогим. Соль генерируется и хранится внутри результата."""
+    return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt(rounds=BCRYPT_ROUNDS)).decode("ascii")
+
+
+def _legacy_hash(password: str, salt: str) -> str:
+    """Старая схема (до 2026-10-01): sha256(соль + пароль). Только для
+    проверки паролей пользователей, ещё не перешедших на bcrypt."""
     return hashlib.sha256((salt + password).encode("utf-8")).hexdigest()
+
+
+def _password_matches(user: "User", password: str) -> bool:
+    if user.salt is not None:
+        return secrets.compare_digest(user.password_hash, _legacy_hash(password, user.salt))
+    return bcrypt.checkpw(password.encode("utf-8"), user.password_hash.encode("ascii"))
 
 
 def _token_hash(token: str) -> str:
@@ -76,16 +108,15 @@ class AuthStore:
         email = email.strip().lower()
         if not email or "@" not in email:
             raise AuthError("Некорректный email")
-        if len(password) < 4:
-            raise AuthError("Пароль слишком короткий (мин. 4 символа)")
+        if len(password) < MIN_PASSWORD_LENGTH:
+            raise AuthError(f"Пароль слишком короткий (мин. {MIN_PASSWORD_LENGTH} символов)")
 
-        salt = secrets.token_hex(8)
         user = User(
             user_id=secrets.token_hex(8),
             email=email,
             name=name.strip() or email.split("@")[0],
-            password_hash=_hash_password(password, salt),
-            salt=salt,
+            password_hash=_hash_password(password),
+            salt=None,
         )
         try:
             with db.transaction() as conn:
@@ -105,16 +136,25 @@ class AuthStore:
     def login(self, email: str, password: str) -> tuple[User, str]:
         email = email.strip().lower()
         user = self._user_by_email(email)
-        if user is None or user.password_hash != _hash_password(password, user.salt):
+        if user is None or not _password_matches(user, password):
             # Намеренно одна и та же ошибка для "нет юзера" и "неверный пароль",
             # чтобы не палить, какие email зарегистрированы.
             raise AuthError("Неверный email или пароль")
 
         token = secrets.token_urlsafe(24)
         with db.transaction() as conn:
+            if user.salt is not None:
+                # Пароль только что проверен по старой схеме — пересчитываем
+                # хэш в bcrypt, пока открытый пароль у нас в руках.
+                conn.execute(
+                    "UPDATE users SET password_hash = %s, salt = NULL WHERE user_id = %s",
+                    (_hash_password(password), user.user_id),
+                )
+                logger.info("Хэш пароля переведён на bcrypt: %s", user.email)
             conn.execute(
-                "INSERT INTO sessions (token_hash, user_id) VALUES (%s, %s)",
-                (_token_hash(token), user.user_id),
+                "INSERT INTO sessions (token_hash, user_id, expires_at) "
+                "VALUES (%s, %s, now() + %s)",
+                (_token_hash(token), user.user_id, SESSION_LIFETIME),
             )
         logger.info("Вход выполнен: %s", user.email)
         return user, token
@@ -153,6 +193,17 @@ class AuthStore:
     def logout(self, token: str) -> None:
         with db.transaction() as conn:
             conn.execute("DELETE FROM sessions WHERE token_hash = %s", (_token_hash(token),))
+
+    def purge_expired_sessions(self) -> int:
+        """Удаляет просроченные сессии. Возвращает их число. Сами по себе
+        просроченные токены и так не работают (user_by_token проверяет
+        expires_at) — это только уборка таблицы."""
+        with db.transaction() as conn:
+            cur = conn.execute("DELETE FROM sessions WHERE expires_at <= now()")
+            count = cur.rowcount
+        if count:
+            logger.info("Удалено просроченных сессий: %d", count)
+        return count
 
     def all_users(self) -> list[User]:
         """Для отладки/тестов — список всех зарегистрированных пользователей."""

@@ -1,3 +1,7 @@
+# Сервер Mimir — то, что нужно для запуска API (в том числе в облаке).
+# Локальная нейросеть и голос — отдельно, см. requirements-ml.txt и
+# requirements-voice.txt: сервер работает без них.
+
 # Ядро / API
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
@@ -11,16 +15,11 @@ python-multipart==0.0.9  # нужен FastAPI для Form/File в /messages/send
 psycopg[binary]==3.2.3
 psycopg-pool==3.2.4
 
+# Пароли
+bcrypt==4.2.0
+
 # Claude
 anthropic==0.34.2
 
-# Голос
-#openai-whisper==20231117
-pyttsx3==2.90
-requests==2.32.3
-
-# Своя нейросеть
-torch==2.4.1
-
-# WebSocket (используется через fastapi/uvicorn[standard], указан явно на всякий случай)
+# WebSocket (используется через fastapi/uvicorn[standard], указан явно)
 websockets==13.1
