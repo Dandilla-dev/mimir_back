@@ -171,8 +171,9 @@ def _send_message_tx(
     # Исходящая — fail-closed на СБОЕ проверки (ядро продукта, утечка от
     # сотрудника): если проверка не отработала, сообщение НЕ сохраняется и
     # не доставляется вообще никому. check_outgoing() сама возвращает None
-    # для личных/standalone аккаунтов — для них этот блок не бросает и не
-    # блокирует.
+    # для standalone-отправителя (без одобренного членства) — для него этот
+    # блок не бросает, не блокирует и ничего не пишет в dlp_event_records
+    # (Р4/Р5).
     try:
         outgoing_check = check_outgoing(
             message, org_store, auth_store, contacts_store, watchlist_store, access_store
@@ -218,6 +219,10 @@ def _send_message_tx(
     # сообщение всё равно доставляется как обычно. Вложенная транзакция
     # (SAVEPOINT): ошибка БД внутри проверки откатывает только её, а не
     # всю отправку — иначе транзакция осталась бы в сломанном состоянии.
+    # check_incoming() возвращает проверки только для получателей с
+    # одобренным членством (по правилам ИХ организации) — для standalone-
+    # получателей проверок нет, и ниже в dlp_event_records для них ничего
+    # не пишется (Р4/Р5).
     try:
         with db.transaction():
             incoming_checks = check_incoming(
@@ -234,9 +239,11 @@ def _send_message_tx(
         dlp_checks.append((check, classifications))
 
         # Автоизоляция получателя: входящий THREAT сообщение НЕ блокирует
-        # (fail-open), но получателя изолирует — если он org-linked. Для
-        # personal-аккаунтов изоляция не применяется — снять её было бы
-        # некому, у personal нет security_officer.
+        # (fail-open), но получателя изолирует. check_incoming() и так
+        # возвращает проверки только org-linked получателей, поэтому
+        # повторная проверка членства ниже — страховка: изолировать
+        # standalone-аккаунт нельзя, снять изоляцию было бы некому (нет
+        # security_officer).
         is_threat, threat_reasons = _threat_decision(classifications)
         if is_threat and org_store.get_active_membership(check.subject_user_id) is not None:
             isolation_store.isolate(check.subject_user_id, threat_reasons, message.message_id)

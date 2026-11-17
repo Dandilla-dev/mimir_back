@@ -11,16 +11,20 @@ core/auth_store.py (идентичность) и core/message_parser.py (DLP-п�
 - исходящее сообщение проверяется, только если у отправителя есть
   approved-членство в организации (org_store.is_dlp_active) — это и есть
   тот самый "флаг", живущий на аккаунте, а не на сообщении;
-- входящее сообщение проверяется ВСЕГДА, для каждого получателя, вне
-  зависимости от типа его аккаунта — это защита получателя (фишинг,
-  вредоносные вложения), а не надзор за отправителем.
+- входящее сообщение проверяется только для получателей с approved-
+  членством — по правилам организации ПОЛУЧАТЕЛЯ: это защита компании
+  (фишинг, вредоносные вложения), а не надзор за отправителем, поэтому
+  отправитель может быть и standalone-аккаунтом;
+- переписку standalone-аккаунтов (без одобренного членства) сервер не
+  проверяет ни в одном направлении и DLP-данных о них не собирает
+  (Р4/Р5, mimir_e2ee_dlp_model_v1.md §3).
 
 Один core/messages_store.Message с несколькими получателями порождает:
   - максимум одну проверку "исходящее" (если у отправителя есть флаг) —
     один RawMessage на всех получателей разом, employee_address = отправитель;
-  - ровно N проверок "входящее" — по одной на каждого получателя,
-    employee_address = этот получатель, отправитель как единственный
-    контрагент.
+  - не больше N проверок "входящее" — по одной на каждого получателя с
+    флагом, employee_address = этот получатель, отправитель как
+    единственный контрагент; standalone-получатели не дают ни одной.
 
 ВАЖНО про адреса: messages_store.Message оперирует внутренними user_id
 (хекс-токены из auth_store), а не email. message_parser же (личные домены,
@@ -98,12 +102,19 @@ def _resolve_email(auth_store: AuthStore, user_id: str) -> str:
     return user.email
 
 
-def _resolve_recipients(auth_store: AuthStore, message: Message) -> dict[str, str]:
+def _resolve_recipients(
+    auth_store: AuthStore, message: Message, recipient_ids=None,
+) -> dict[str, str]:
     """Резолвит email каждого получателя независимо — один мусорный/
     несуществующий recipient_id не должен гасить проверку для остальных,
-    настоящих получателей того же сообщения."""
+    настоящих получателей того же сообщения.
+
+    recipient_ids — подмножество получателей (check_incoming() передаёт
+    только org-linked); None = все получатели сообщения."""
+    if recipient_ids is None:
+        recipient_ids = message.recipient_ids
     recipient_emails: dict[str, str] = {}
-    for recipient_id in message.recipient_ids:
+    for recipient_id in recipient_ids:
         try:
             recipient_emails[recipient_id] = _resolve_email(auth_store, recipient_id)
         except BridgeError:
@@ -132,9 +143,11 @@ def _lookups_for(
     зафиксированы в mimir_architecture_v2.md §7, долг закрыт целиком,
     кроме HR (отложено).
 
-    org_id может быть None (личный/standalone аккаунт без организации) —
-    в этом случае watchlist- и access-поля остаются нейтральными, ровно
-    как для contacts_store=None."""
+    org_id может быть None — тогда watchlist- и access-поля остаются
+    нейтральными, ровно как для contacts_store=None. Из check_outgoing()/
+    check_incoming() None сюда не приходит: standalone-аккаунты (без
+    одобренного членства) отсекаются раньше и до сборки lookups не
+    доходят; ветка оставлена как безопасный дефолт для прямых вызовов."""
     is_known_contact = DEFAULT_LOOKUPS.is_known_contact
     if contacts_store is not None:
         is_known_contact = make_lookups_from_contacts_store(
@@ -177,7 +190,7 @@ def check_outgoing(
 ) -> DLPCheck | None:
     """Исходящая проверка — утечка конфиденциальных данных от сотрудника.
     Срабатывает, только если у отправителя активное (approved) членство в
-    организации (mimir_account_linkage_v1.md §2); для личных/standalone
+    организации (mimir_account_linkage_v1.md §2); для standalone-
     аккаунтов возвращает None и НИКОГДА не строит RawMessage — эта ветка
     для них попросту не существует, не просто "пропущена".
 
@@ -218,10 +231,26 @@ def check_incoming(
     watchlist_store=None,
     access_store=None,
 ) -> list[DLPCheck]:
-    """Входящая проверка — фишинг/вредоносные вложения. Срабатывает ВСЕГДА,
-    для каждого получателя, независимо от типа аккаунта (в т.ч. личный
-    Mimir) — это защита получателя, а не контроль над отправителем
-    (mimir_account_linkage_v1.md §2).
+    """Входящая проверка — фишинг/вредоносные вложения. Срабатывает только
+    для получателей с активным (approved) членством в организации — по
+    одной проверке на каждого такого получателя, по правилам ЕГО
+    организации (watchlist, реестр устройств, гранты). Это защита
+    компании-получателя, а не надзор за отправителем: отправитель может
+    быть кем угодно, в т.ч. standalone-аккаунтом (mimir_account_linkage_v1.md
+    §2, mimir_e2ee_dlp_model_v1.md §3).
+
+    Standalone-получатель (без одобренного членства, в т.ч. с заявкой в
+    статусе pending) пропускается ЦЕЛИКОМ: для него не резолвится email,
+    не строится RawMessage, не вызывается парсер и не создаётся DLPCheck —
+    значит, вызывающей стороне нечего записать в dlp_event_records (Р4/Р5:
+    переписку standalone-аккаунтов сервер не проверяет и DLP-данных о них
+    не собирает). Если ни одного такого получателя нет — возвращается
+    пустой список, не резолвится даже отправитель.
+
+    org_store здесь — гейтинг "проверять или нет" (зеркально
+    check_outgoing(), только по получателю, а не по отправителю), и
+    заодно источник org_id для подстановки watchlist/access этого
+    получателя.
 
     ПОЛИТИКА ПРИ СБОЕ (вызывающая сторона её применяет): это защита сверх
     базового уровня (то же, от чего пользователь и так не защищён в любом
@@ -229,16 +258,19 @@ def check_incoming(
     отсюда не должно останавливать отправку, только логироваться. Откат
     при сбое — это откат к уровню риска обычного Telegram, а не новая
     уязвимость.
-
-    org_store здесь только для резолва org_id каждого получателя (чтобы
-    подставить его watchlist) — направление всё равно проверяется
-    безусловно (см. выше), в отличие от check_outgoing() это НЕ гейтинг
-    "проверять или нет". У получателя без организации (personal Mimir)
-    get_active_membership() вернёт None — watchlist-поля для него
-    остаются нейтральными, проверка всё равно выполняется.
     """
+    # Сначала гейтинг по членству — до любой работы с данными получателя.
+    # dict, а не list: повторный recipient_id не даёт двух проверок.
+    member_org_ids: dict[str, str] = {}
+    for recipient_id in message.recipient_ids:
+        membership = org_store.get_active_membership(recipient_id)
+        if membership is not None:
+            member_org_ids[recipient_id] = membership.org_id
+    if not member_org_ids:
+        return []
+
     sender_email = _resolve_email(auth_store, message.sender_id)
-    recipient_emails = _resolve_recipients(auth_store, message)
+    recipient_emails = _resolve_recipients(auth_store, message, member_org_ids.keys())
     attachments = [_to_raw_attachment(a) for a in message.attachments]
     sent_at = _to_datetime(message.sent_at)
 
@@ -259,8 +291,7 @@ def check_incoming(
             # об устройстве получателя в этом запросе нет вообще, поэтому
             # оставляем None -> признак остаётся нейтральным.
         )
-        membership = org_store.get_active_membership(recipient_id)
-        org_id = membership.org_id if membership is not None else None
+        org_id = member_org_ids[recipient_id]
         lookups = _lookups_for(contacts_store, watchlist_store, access_store, org_id, recipient_id)
         events = parse_raw_message(raw, lookups)
         checks.append(DLPCheck(subject_user_id=recipient_id, is_incoming=True, events=events))

@@ -11,9 +11,9 @@ parse_raw_message().
 Признаки, зависящие от трёх баз, зафиксированных как долг в
 mimir_architecture_v2.md §7 (список наблюдаемых доменов, реестр
 устройств, роли доступа) — подставляются нейтральным значением 0/False
-ТОЛЬКО когда соответствующий стор не подключён к ParserLookups (личные/
-standalone аккаунты без организации, либо org_id не резолвится в точке
-вызова) — см. make_lookups_from_watchlist_store()/
+ТОЛЬКО когда соответствующий стор не подключён к ParserLookups (нет
+org_id в точке вызова; standalone-аккаунты без организации до парсера
+не доходят вообще — мост их отсекает, Р4/Р5) — см. make_lookups_from_watchlist_store()/
 make_lookups_from_access_store() ниже и core/message_bridge._lookups_for().
 Статус на 2026-09-16: watchlist доменов (core/watchlist_store.py) и
 устройства+роли (core/access_store.py) реализованы и подключены — долг
